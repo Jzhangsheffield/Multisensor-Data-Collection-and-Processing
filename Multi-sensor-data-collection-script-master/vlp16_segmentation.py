@@ -130,7 +130,7 @@ def safe_class_name(action: str, obj: str) -> str:
 
 # ----------------- STRICT annotation.csv selection -----------------
 # 支持：N_run_24_annotation.csv  或  N_run_24-37_annotation.csv
-STRICT_ANN_RE = re.compile(r"^MR_run_(\d+)(?:-(\d+))?_annotation\.csv$")
+STRICT_ANN_RE = re.compile(r"^N_run_(\d+)(?:-(\d+))?_annotationlight\.csv$")
 
 def find_strict_annotation_csv(run_dir: Path) -> Path:
     """
@@ -209,11 +209,12 @@ def iter_annotations(csv_path: Path):
                 obj = get(row, "object").strip()
                 start_raw = get(row, "start_ts") or get(row, "start")
                 end_raw = get(row, "end_ts") or get(row, "end")
+                light = get(row, "light").strip()
                 start_key = parse_timestamp_to_key(start_raw)
                 end_key = parse_timestamp_to_key(end_raw)
                 if not action or start_key is None or end_key is None:
                     continue
-                yield {"action": action, "object": obj, "start_key": start_key, "end_key": end_key}
+                yield {"action": action, "object": obj, "start_key": start_key, "end_key": end_key, "light": light}
 
         else:
             reader = csv.reader(f)
@@ -225,11 +226,12 @@ def iter_annotations(csv_path: Path):
                 obj = row[2].strip() if len(row) > 2 else ""
                 start_raw = row[5] if len(row) > 5 else row[3]
                 end_raw = row[6] if len(row) > 6 else row[4]
+                light = row[9].strip() if len(row) > 9 else ""
                 start_key = parse_timestamp_to_key(start_raw)
                 end_key = parse_timestamp_to_key(end_raw)
                 if not action or start_key is None or end_key is None:
                     continue
-                yield {"action": action, "object": obj, "start_key": start_key, "end_key": end_key}
+                yield {"action": action, "object": obj, "start_key": start_key, "end_key": end_key, "light": light}
 
 
 # ----------------- Radar frames indexing -----------------
@@ -394,12 +396,13 @@ def process_one_run(a_run: Path, b_run: Path, out_root: Path, debug: bool = Fals
         obj = ann["object"]
         start_key = ann["start_key"]
         end_key = ann["end_key"]
+        light = ann["light"]
 
         class_name = safe_class_name(action, obj)
         class_dir = out_root / class_name
         ensure_dir(class_dir)
 
-        clip_name = f"{a_run.name}_clip_{clip_counter:06d}"
+        clip_name = f"{a_run.name}_clip_{clip_counter:06d}_{light}"
         clip_dir = class_dir / clip_name
         ensure_dir(clip_dir)
 

@@ -143,21 +143,54 @@ def ensure_dir(p: Path):
 
 
 def list_run_dirs(root: Path) -> List[Path]:
+    """
+    支持：
+      - run_3
+      - run_8-37 / run_8_37
+      - J_run_3
+      - J_run_8-37
+      - 任意前缀 + _run_数字
+    """
     runs = []
     for p in root.iterdir():
-        if p.is_dir() and p.name.startswith("run_"):
+        if not p.is_dir():
+            continue
+        # 匹配：开头是 run_ / run-，或中间出现 _run_ / _run-
+        if re.search(r"(?:^|_)run[-_]\d+(?:[-_]\d+)?$", p.name, flags=re.IGNORECASE):
             runs.append(p)
-    return sorted(runs)
+    return sorted(runs, key=lambda x: x.name.lower())
+
 
 
 def find_annotation_csv(run_dir: Path) -> Path:
-    p = run_dir / "N_run_1_annotation.csv"
-    if p.exists():
-        return p
-    cands = sorted(run_dir.glob("*annotation.csv"))
+    """
+    与第二个脚本保持一致：
+    - 只接受 *annotationlight.csv
+    - 忽略任何包含 'copy' 的文件
+    """
+    cands = []
+    for p in run_dir.iterdir():
+        if not (p.is_file() and p.suffix.lower() == ".csv"):
+            continue
+        name_low = p.name.lower()
+        if "copy" in name_low:
+            continue
+        if name_low.endswith("annotationlight.csv"):
+            cands.append(p)
+
     if not cands:
-        raise FileNotFoundError(f"Annotation csv not found in: {run_dir}")
+        raise FileNotFoundError(
+            f"Annotationlight csv not found in: {run_dir} "
+            f"(expect *annotationlight.csv, ignoring copy)"
+        )
+
+    cands.sort(key=lambda x: x.name.lower())
+    if len(cands) > 1:
+        print(f"[WARN] {run_dir.name}: multiple annotationlight CSVs found: "
+              f"{[c.name for c in cands]}, using {cands[0].name}")
+
     return cands[0]
+
 
 
 def safe_class_name(action: str, obj: str) -> str:
@@ -267,22 +300,98 @@ def detect_header(sample_text: str) -> bool:
     return ("action" in low) and ("object" in low) and ("," in low)
 
 
+# def iter_annotations(csv_path: Path):
+#     """
+#     Yield dicts: {action, object, start_us, end_us}
+#     Supports header/no-header.
+#     """
+#     with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+#         sample = f.read(4096)
+#         f.seek(0)
+#         has_header = detect_header(sample)
+
+#         if has_header:
+#             reader = csv.DictReader(f)
+#             colmap = {c.strip().lower(): c for c in (reader.fieldnames or [])}
+
+#             def get(row, key):
+#                 kk = key.lower()
+#                 if kk not in colmap:
+#                     return ""
+#                 return row.get(colmap[kk], "")
+
+#             for row in reader:
+#                 action = get(row, "action").strip()
+#                 obj = get(row, "object").strip()
+
+#                 # Prefer start_ts/end_ts if present
+#                 start_raw = get(row, "start_ts") or get(row, "start")
+#                 end_raw = get(row, "end_ts") or get(row, "end")
+#                 light = get(row, "light").strip()
+
+#                 start_us = parse_timestamp_to_us(start_raw)
+#                 end_us = parse_timestamp_to_us(end_raw)
+
+#                 if not action or start_us is None or end_us is None:
+#                     continue
+
+#                 yield {
+#                     "action": action,
+#                     "object": obj,
+#                     "start_us": start_us,
+#                     "end_us": end_us,
+#                     "light": light
+#                 }
+#         else:
+#             reader = csv.reader(f)
+#             for row in reader:
+#                 if not row or len(row) < 7:
+#                     continue
+
+#                 # idx, action, object, start, end, start_ts, end_ts, run, light
+#                 action = row[1].strip() if len(row) > 1 else ""
+#                 obj = row[2].strip() if len(row) > 2 else ""
+
+#                 start_raw = row[5] if len(row) > 5 else row[3]
+#                 end_raw = row[6] if len(row) > 6 else row[4]
+
+#                 light = row[9] if len(row) > 9 else None
+
+#                 start_us = parse_timestamp_to_us(start_raw)
+#                 end_us = parse_timestamp_to_us(end_raw)
+
+#                 if not action or start_us is None or end_us is None:
+#                     continue
+
+#                 yield {
+#                     "action": action,
+#                     "object": obj,
+#                     "start_us": start_us,
+#                     "end_us": end_us,
+#                     "light": light
+#                 }
+
 def iter_annotations(csv_path: Path):
     """
-    Yield dicts: {action, object, start_us, end_us}
-    Supports header/no-header.
+    Yield dicts: {action, object, start_us, end_us, light}
+    采用和第二个脚本一样的策略：
+      - 固定逗号分隔（不使用 Sniffer sniff delimiter）
+      - header 用关键词(action/object)判断（不使用 Sniffer.has_header）
     """
     with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
         sample = f.read(4096)
         f.seek(0)
-        has_header = detect_header(sample)
+
+        # 和第二个脚本一致：关键词判断是否有表头
+        low = sample.lower()
+        has_header = ("action" in low) and ("object" in low)
 
         if has_header:
-            reader = csv.DictReader(f)
+            reader = csv.DictReader(f)  # 默认逗号分隔
             colmap = {c.strip().lower(): c for c in (reader.fieldnames or [])}
 
             def get(row, key):
-                kk = key.lower()
+                kk = key.strip().lower()
                 if kk not in colmap:
                     return ""
                 return row.get(colmap[kk], "")
@@ -291,12 +400,13 @@ def iter_annotations(csv_path: Path):
                 action = get(row, "action").strip()
                 obj = get(row, "object").strip()
 
-                # Prefer start_ts/end_ts if present
                 start_raw = get(row, "start_ts") or get(row, "start")
-                end_raw = get(row, "end_ts") or get(row, "end")
+                end_raw   = get(row, "end_ts")   or get(row, "end")
+
+                light = get(row, "light").strip()
 
                 start_us = parse_timestamp_to_us(start_raw)
-                end_us = parse_timestamp_to_us(end_raw)
+                end_us   = parse_timestamp_to_us(end_raw)
 
                 if not action or start_us is None or end_us is None:
                     continue
@@ -306,22 +416,26 @@ def iter_annotations(csv_path: Path):
                     "object": obj,
                     "start_us": start_us,
                     "end_us": end_us,
+                    "light": light,
                 }
+
         else:
+            # 无表头：仍然按逗号分隔读取
             reader = csv.reader(f)
             for row in reader:
                 if not row or len(row) < 7:
                     continue
 
-                # idx, action, object, start, end, start_ts, end_ts, comment
                 action = row[1].strip() if len(row) > 1 else ""
-                obj = row[2].strip() if len(row) > 2 else ""
+                obj    = row[2].strip() if len(row) > 2 else ""
 
                 start_raw = row[5] if len(row) > 5 else row[3]
-                end_raw = row[6] if len(row) > 6 else row[4]
+                end_raw   = row[6] if len(row) > 6 else row[4]
+
+                light = row[9].strip() if len(row) > 9 else ""
 
                 start_us = parse_timestamp_to_us(start_raw)
-                end_us = parse_timestamp_to_us(end_raw)
+                end_us   = parse_timestamp_to_us(end_raw)
 
                 if not action or start_us is None or end_us is None:
                     continue
@@ -331,7 +445,9 @@ def iter_annotations(csv_path: Path):
                     "object": obj,
                     "start_us": start_us,
                     "end_us": end_us,
+                    "light": light,
                 }
+
 
 
 # ----------------- Core processing -----------------
@@ -348,6 +464,7 @@ def process_one_run(
     debug_on_empty_only: bool,
 ):
     ann_csv = find_annotation_csv(run_dir)
+    print("[ANN]", run_dir.name, "->", ann_csv.name)
 
     cam1_frames_dir = run_dir / cam1_id / cam1_sub
     cam2_frames_dir = run_dir / cam2_id / cam2_sub
@@ -368,12 +485,13 @@ def process_one_run(
         obj = ann["object"]
         start_us = ann["start_us"]
         end_us = ann["end_us"]
+        light = ann["light"]
 
         class_name = safe_class_name(action, obj)
         class_dir = out_root / class_name
         ensure_dir(class_dir)
 
-        clip_name = f"{run_dir.name}_clip_{clip_counter:06d}"
+        clip_name = f"{run_dir.name}_clip_{clip_counter:06d}_{light}"
         clip_dir = class_dir / clip_name
         ensure_dir(clip_dir)
 

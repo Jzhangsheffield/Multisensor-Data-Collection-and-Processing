@@ -118,7 +118,7 @@ def build_b_run_map(b_root: Path) -> Dict[int, Path]:
 # ------------------------
 # 3) 严格选择 annotation 文件（忽略 copy）
 # ------------------------
-ANN_RE = re.compile(r"^J_run_(\d+)(?:-(\d+))?_annotation\.csv$", re.IGNORECASE)
+ANN_RE = re.compile(r"^N_run_(\d+)(?:-(\d+))?_annotationlight\.csv$", re.IGNORECASE)
 
 def find_annotation_csv_strict(run_dir: Path) -> Path:
     """
@@ -259,9 +259,10 @@ def iter_annotations_rows(ann_csv: Path):
                 obj = get(row, "object").strip()
                 start = get(row, "start").strip()
                 end = get(row, "end").strip()
+                light = get(row, "light").strip()
                 if not action or not start or not end:
                     continue
-                yield action, obj, start, end
+                yield action, obj, start, end, light
         else:
             # fallback: idx, action, object, start, end, ...
             reader = csv.reader(f)
@@ -272,6 +273,8 @@ def iter_annotations_rows(ann_csv: Path):
                 obj = row[2].strip() if len(row) > 2 else ""
                 start = row[3].strip() if len(row) > 3 else ""
                 end = row[4].strip() if len(row) > 4 else ""
+                light = row[9].strip() if len(row) > 9 else ""
+
                 if not action or not start or not end:
                     continue
                 yield action, obj, start, end
@@ -369,7 +372,7 @@ def main():
             print(f"[WARN] {b_run.name}: 未找到 right CSV")
 
         clip_idx = 0
-        for action, obj, start_s, end_s in iter_annotations_rows(ann_csv):
+        for action, obj, start_s, end_s, light in iter_annotations_rows(ann_csv):
             clip_idx += 1
             total_clips += 1
 
@@ -382,7 +385,7 @@ def main():
                 continue
 
             cls = action_class_name(action, obj)
-            clip_folder = f"{a_run.name}_clip_{clip_idx:06d}"
+            clip_folder = f"{a_run.name}_clip_{clip_idx:06d}_{light}"
             base_out = args.out_root / cls / clip_folder
 
             wrote_any = False
