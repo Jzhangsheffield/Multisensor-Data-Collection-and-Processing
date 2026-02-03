@@ -723,9 +723,9 @@ def main():
                         default=r"D:\Junxi_data\MULTISENSOR_DATA_COLLECTION\_raw_data_structured\Thermal_Crimping_Dataset\kinect\RGB")
     parser.add_argument("--cam", type=str, default="cam_001431512812")
     parser.add_argument("--out_csv", type=str,
-                        default=r"D:\Junxi_data\MULTISENSOR_DATA_COLLECTION\_raw_data_structured\Thermal_Crimping_Dataset\kinect\RGB\review_results.csv")
+                        default=r"D:\Junxi_data\MULTISENSOR_DATA_COLLECTION\_raw_data_structured\Thermal_Crimping_Dataset\kinect\RGB\MR_review_results.csv")
 
-    parser.add_argument("--letters", nargs="*", default=None, help="Only check letter folders, e.g. --letters N MR")
+    parser.add_argument("--letters", nargs="*", default="MR", help="Only check letter folders, e.g. --letters N MR")
     parser.add_argument("--actions", nargs="*", default=None, help="Only check actions, e.g. --actions adjust_slider")
 
     parser.add_argument("--fps", type=float, default=30.0, help="Playback FPS (visual speed), e.g. --fps 15")
@@ -821,9 +821,9 @@ def main():
 
             if input_mode:
                 if input_stage == "reason":
-                    prompt = "请输入不通过理由："
+                    prompt = "Reasons for not pass: "
                 else:
-                    prompt = "请输入后续处理方式："
+                    prompt = "What to do next: "
             else:
                 prompt = ""
 
