@@ -5,18 +5,23 @@ r"""
 Multi-subject: Visualize alignment between RGB frames (30Hz) and Armband (MindRove EMG+IMU)
 by plotting motion-energy curves (NO cross-correlation, NO offset estimation).
 
-What this script does (per subject, per run, per side):
-  1) Build RGB motion energy from consecutive frames (mean absdiff in grayscale)
-  2) Build Armband motion energy from CSV (EMG/IMU/fusion)
-  3) Compute intersection time window and trim:
-       t_start = max(rgb_start, sig_start) + warmup_s
-       t_end   = min(rgb_end,   sig_end)   - taildrop_s
-  4) Interpolate both signals onto a unified time grid (grid_dt)
-  5) (Optional) z-score normalization for easier peak comparison
-  6) (Optional) event mask where BOTH are above event_z (z-score space)
-  7) Plot RGB vs Armband motion on the same time axis (and optional event mask band)
+NEW FEATURES (added without breaking existing workflow):
+  A) (Optional) Top x-axis: map trimmed window back to FULL RGB timeline
+     - bottom axis: time since trimmed start (unchanged)
+     - top axis   : time since RGB run start (full RGB timeline)
 
-You can manually inspect whether peaks match (instead of trusting correlation-based offsets).
+  B) Peak detection + map peaks back to nearest original RGB frame filename
+     - detect peaks on rgb_z / sig_z (z-score space) inside the trimmed window
+     - optionally require event mask (both strong) before considering peaks
+     - for each detected peak time, locate nearest RGB frame in the FULL run frames list
+       (binary search; robust and fast)
+     - save peak->frame mapping into JSON/JSONL summaries
+     - (optional) annotate peaks on plot
+
+The purpose:
+  When you see a peak, you can immediately know:
+    - the peak happens at which second of the original run (full RGB timeline)
+    - the nearest original RGB frame filename (timestamped jpg) to check the video
 
 Inputs:
 RGB:
@@ -29,18 +34,11 @@ Armband:
 
 Outputs per subject:
   <subject_out_dir>/
-    run_plots.jsonl   # per run summary (append immediately)
-    run_plots.json    # summary (written at end)
+    run_plots.jsonl
+    run_plots.json
     plots/
       run_1__armband__left.png
       run_1__armband__right.png
-
-Example:
-  python plot_rgb_armband_energy.py ^
-    --subject_roots D:\...\_raw_data_structured\N D:\...\_raw_data_structured\MR ^
-    --armband_mode imu ^
-    --grid_dt 0.02 --warmup_s 10 --taildrop_s 3 ^
-    --event_z 0.3 --plot_event_mask
 """
 
 import argparse
@@ -48,7 +46,9 @@ import json
 import re
 from pathlib import Path
 from datetime import datetime
+from bisect import bisect_left
 from typing import List, Tuple, Optional, Dict
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import cv2
@@ -65,31 +65,27 @@ import matplotlib.pyplot as plt
 TS_RE = re.compile(r"(\d{8}_\d{6}_\d{6})")  # YYYYMMDD_HHMMSS_micro
 
 
-def parse_ts_from_name(name: str) -> Optional[float]:
-    """
-    Parse timestamp substring 'YYYYMMDD_HHMMSS_micro' from a filename and return epoch seconds float.
-    Returns None if parsing fails.
-    """
+def parse_ts_from_name(name: str, tz_name: str = "Europe/London") -> Optional[float]:
     m = TS_RE.search(name)
     if not m:
         return None
     s = m.group(1)
     try:
         dt = datetime.strptime(s, "%Y%m%d_%H%M%S_%f")
+        dt = dt.replace(tzinfo=ZoneInfo(tz_name))   # 关键：解释为 tz_name 的本地时间
+        return dt.timestamp()                       # 关键：转成真正 epoch 秒
     except Exception:
         return None
-    epoch = datetime(1970, 1, 1)
-    return (dt - epoch).total_seconds()
 
 
-def list_files_sorted_by_ts(folder: Path, suffix: str) -> List[Tuple[float, Path]]:
+def list_files_sorted_by_ts(folder: Path, suffix: str, tz_name: str) -> List[Tuple[float, Path]]:
     """
     List files in folder matching suffix, parse timestamps from filenames,
     filter out bogus timestamps (< 2010-01-01), return sorted (t, path).
     """
     items: List[Tuple[float, Path]] = []
     for p in folder.glob(f"*{suffix}"):
-        t = parse_ts_from_name(p.name)
+        t = parse_ts_from_name(p.name, tz_name=tz_name)
         if t is None or not np.isfinite(t):
             continue
         if t < 1262304000.0:  # 2010-01-01
@@ -97,6 +93,11 @@ def list_files_sorted_by_ts(folder: Path, suffix: str) -> List[Tuple[float, Path
         items.append((t, p))
     items.sort(key=lambda x: x[0])
     return items
+
+
+def epoch_to_timestr(t_epoch: float, tz_name: str = "Europe/London") -> str:
+    dt = datetime.fromtimestamp(float(t_epoch), tz=ZoneInfo(tz_name))
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
 # =========================
@@ -307,8 +308,6 @@ def compute_armband_motion(
     dt = np.diff(t)
 
     # filter weird dt (logging hiccup)
-    # - EMG sample dt should be ~0.002s
-    # - keep a broad safe range (0.0005..0.2) to tolerate occasional gaps
     good = (dt > 0.0005) & (dt < 0.2)
     if good.sum() < 50:
         good = np.ones_like(dt, dtype=bool)
@@ -427,6 +426,183 @@ def find_armband_csv(armband_folder: Path, side: str) -> Optional[Path]:
 
 
 # =========================
+# Peak detection + mapping to nearest RGB frame
+# =========================
+def find_local_peaks_1d(
+    y: np.ndarray,
+    x: np.ndarray,
+    min_height: float = 1.0,
+    min_prominence: float = 0.3,
+    min_distance_s: float = 0.35,
+    max_peaks: int = 30,
+    valid_mask: Optional[np.ndarray] = None,
+) -> List[int]:
+    """
+    Simple, dependency-free local peak finder.
+
+    Inputs:
+      y: signal values (e.g., z-score curve)
+      x: same length, time in seconds (e.g., x_trim = t_grid - t_grid[0])
+      min_height: reject peaks below this y
+      min_prominence: reject peaks whose (peak - max(neighbor_min)) too small
+                      (rough prominence; not exact SciPy definition)
+      min_distance_s: enforce spacing between peaks (keep stronger one)
+      max_peaks: keep at most this many peaks (strongest first)
+      valid_mask: optional boolean mask; only consider peaks where valid_mask[idx]=True
+
+    Output:
+      list of peak indices into y/x (sorted by time).
+    """
+    y = np.asarray(y, dtype=np.float64)
+    x = np.asarray(x, dtype=np.float64)
+    n = y.size
+    if n < 3:
+        return []
+
+    if valid_mask is None:
+        valid_mask = np.ones(n, dtype=bool)
+    else:
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+        if valid_mask.size != n:
+            raise ValueError("valid_mask length must equal y length")
+
+    # 1) raw local maxima candidates
+    cand = []
+    for i in range(1, n - 1):
+        if not valid_mask[i]:
+            continue
+        if y[i] >= min_height and y[i] > y[i - 1] and y[i] >= y[i + 1]:
+            cand.append(i)
+    if not cand:
+        return []
+
+    # 2) rough prominence filtering
+    #    prominence ~ peak - max(min(left_window), min(right_window))
+    #    Use a small window in time to estimate "local baseline"
+    #    window size derived from min_distance_s (reasonable scale)
+    half_win_s = max(0.2, 0.5 * float(min_distance_s))
+    keep = []
+    for i in cand:
+        t0 = x[i] - half_win_s
+        t1 = x[i] + half_win_s
+        L = np.where((x >= t0) & (x <= x[i]))[0]
+        R = np.where((x >= x[i]) & (x <= t1))[0]
+        if L.size < 2 or R.size < 2:
+            continue
+        left_min = float(np.min(y[L]))
+        right_min = float(np.min(y[R]))
+        prom = float(y[i] - max(left_min, right_min))
+        if prom >= min_prominence:
+            keep.append((i, y[i], prom))
+    if not keep:
+        return []
+
+    # 3) enforce min_distance_s (non-maximum suppression in time)
+    #    Sort by peak height desc; pick and suppress neighbors within min_distance_s
+    keep.sort(key=lambda t: (t[1], t[2]), reverse=True)
+    selected = []
+    for i, height, prom in keep:
+        ok = True
+        for j in selected:
+            if abs(float(x[i] - x[j])) < min_distance_s:
+                ok = False
+                break
+        if ok:
+            selected.append(i)
+        if len(selected) >= max_peaks:
+            break
+
+    selected = sorted(selected)
+    return selected
+
+
+def nearest_rgb_frame(
+    rgb_frames: List[Tuple[float, Path]],
+    t_epoch: float,
+) -> Optional[Dict]:
+    """
+    Given full RGB frames list (sorted by time) and a target epoch time,
+    return info of the nearest frame (by absolute time difference).
+
+    Output dict:
+      {
+        "nearest_frame_name": "...jpg",
+        "nearest_frame_path": "...",
+        "nearest_frame_epoch": 123.456,
+        "nearest_frame_timestr": "...",
+        "nearest_frame_dt_s": 0.0123,   # frame_time - target_time
+      }
+    """
+    if not rgb_frames:
+        return None
+    times = [t for t, _ in rgb_frames]
+    k = bisect_left(times, float(t_epoch))
+
+    # candidates: k-1 and k
+    best_idx = None
+    best_abs = None
+    for idx in [k - 1, k]:
+        if 0 <= idx < len(rgb_frames):
+            dt = float(times[idx] - float(t_epoch))
+            adt = abs(dt)
+            if best_abs is None or adt < best_abs:
+                best_abs = adt
+                best_idx = idx
+
+    if best_idx is None:
+        return None
+
+    tt, pp = rgb_frames[best_idx]
+    return {
+        "nearest_frame_name": pp.name,
+        "nearest_frame_path": str(pp),
+        "nearest_frame_epoch": float(tt),
+        "nearest_frame_timestr": epoch_to_timestr(float(tt)),
+        "nearest_frame_dt_s": float(float(tt) - float(t_epoch)),
+    }
+
+
+def build_peak_records(
+    kind: str,
+    peak_indices: List[int],
+    t_grid: np.ndarray,
+    x_trim: np.ndarray,
+    y_used: np.ndarray,
+    rgb_frames: List[Tuple[float, Path]],
+    rgb_run_start_epoch: float,
+    t_trim_start_epoch: float,
+) -> List[Dict]:
+    """
+    Convert peak indices into serializable records, including mapping to nearest RGB frame.
+
+    kind: "rgb" | "sig" | "joint"
+    """
+    recs = []
+    for idx in peak_indices:
+        t_peak = float(t_grid[idx])         # epoch seconds
+        x_peak = float(x_trim[idx])         # seconds since trimmed start
+        y_peak = float(y_used[idx])         # value on the curve we used to detect peaks (zscore space by default)
+
+        m = nearest_rgb_frame(rgb_frames, t_peak)
+        rec = {
+            "kind": kind,
+            "idx_grid": int(idx),
+            "t_peak_epoch": t_peak,
+            "t_peak_timestr": epoch_to_timestr(t_peak),
+            "t_peak_since_trim_s": x_peak,
+            "t_peak_since_rgb_start_s": float(t_peak - float(rgb_run_start_epoch)),
+            "y_peak": y_peak,
+            # nearest original RGB frame for video lookup
+            "nearest_rgb": m,
+            # convenience: "nearest frame's time since RGB start"
+            "nearest_frame_since_rgb_start_s": None if m is None else float(m["nearest_frame_epoch"] - float(rgb_run_start_epoch)),
+            "nearest_frame_since_trim_s": None if m is None else float(m["nearest_frame_epoch"] - float(t_trim_start_epoch)),
+        }
+        recs.append(rec)
+    return recs
+
+
+# =========================
 # Plotting
 # =========================
 def plot_energy(
@@ -437,29 +613,90 @@ def plot_energy(
     title: str,
     mask_evt: Optional[np.ndarray] = None,
     ylabel: str = "Motion energy",
+    # NEW: top axis mapping + optional peak annotation
+    rgb_run_start_epoch: Optional[float] = None,
+    add_top_axis_rgb: bool = False,
+    add_top_axis_datetime: bool = False,
+    annotate_peaks: bool = False,
+    peak_xs: Optional[List[float]] = None, 
+    top_axis_tick_s: float = 2.0  # x positions in seconds since trimmed start
 ):
     """
     Plot RGB and Armband motion energy curves on the same time axis.
-    If mask_evt is provided, overlay it as a thin band near bottom (good for checking event coverage).
+
+    Bottom axis (unchanged): time since trimmed start (t_grid[0]).
+    Top axis (optional): time since RGB run start (first RGB frame).
     """
     out_png.parent.mkdir(parents=True, exist_ok=True)
 
     plt.figure(figsize=(12, 6))
-    x = t_grid - t_grid[0]
+    ax = plt.gca()
 
-    plt.plot(x, rgb_y, label="RGB motion")
-    plt.plot(x, sig_y, label="Armband motion")
+    # bottom axis: unchanged behavior
+    x_trim = t_grid - t_grid[0]
+    ax.plot(x_trim, rgb_y, label="RGB motion")
+    ax.plot(x_trim, sig_y, label="Armband motion")
 
     if mask_evt is not None:
         y0 = min(float(np.min(rgb_y)), float(np.min(sig_y))) - 0.5
         y1 = y0 + 0.25
         band = mask_evt.astype(np.float64) * (y1 - y0) + y0
-        plt.plot(x, band, label="Event mask (band)")
+        ax.plot(x_trim, band, label="Event mask (band)")
 
-    plt.xlabel("Time since start (s)")
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.legend()
+    # NEW: annotate peaks by vertical lines (optional)
+    if annotate_peaks and peak_xs:
+        for xx in peak_xs:
+            ax.axvline(float(xx), linewidth=1.0, alpha=0.6)
+
+    ax.set_xlabel("Time since trimmed start (s)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(False)
+
+    # ---------- NEW: top axis mapping to full RGB timeline ----------
+    if add_top_axis_rgb and (rgb_run_start_epoch is not None) and len(t_grid) > 0:
+        offset_s = float(t_grid[0] - float(rgb_run_start_epoch))
+
+        ax2 = ax.twiny()
+        ax2.set_xlim(ax.get_xlim())
+
+        # ===== Top axis ticks: every 2 seconds (avoid sparse ticks) =====
+        # Bottom axis is x_trim (seconds since trimmed start)
+        x0, x1 = ax.get_xlim()  # in seconds since trimmed start
+        step = float(top_axis_tick_s)  # fallback
+
+        # create ticks at multiples of step within [x0, x1]
+        start_tick = np.ceil(x0 / step) * step
+        ticks = np.arange(start_tick, x1 + 1e-6, step, dtype=np.float64)
+
+        # label is seconds since RGB start: (since_trim + offset_s)
+        labels = [f"{(float(t) + offset_s):.0f}" for t in ticks]
+
+        ax2.set_xticks(ticks)
+        ax2.set_xticklabels(labels)
+
+        # Make font smaller + rotate slightly to prevent overlap
+        ax2.tick_params(axis="x", labelsize=8, pad=2)
+        for lab in ax2.get_xticklabels():
+            lab.set_rotation(30)
+            lab.set_ha("left")
+
+        ax2.set_xlabel("Time since RGB run start (s)")
+
+        # Optional sparse datetime hints (avoid clutter)
+        if add_top_axis_datetime:
+            quart = np.linspace(ax.get_xlim()[0], ax.get_xlim()[1], 4)
+            for q in quart:
+                t_epoch = float(rgb_run_start_epoch) + (float(q) + offset_s)
+                ax2.text(
+                    q, 1.02,
+                    epoch_to_timestr(t_epoch),
+                    transform=ax2.get_xaxis_transform(),
+                    ha="center", va="bottom",
+                    fontsize=8,
+                )
+
     plt.tight_layout()
     plt.savefig(out_png, dpi=160)
     plt.close()
@@ -493,22 +730,20 @@ def process_one_run_plot(
     Steps:
       1) RGB motion (midpoint timestamps)
       2) Armband motion (midpoint timestamps)
-      3) Intersection time window:
-           [t_start0, t_end0]
-         Then apply trimming:
-           t_start = t_start0 + warmup_s
-           t_end   = t_end0   - taildrop_s
-      4) Interpolate both motion signals to a unified time grid
-      5) Optional normalization:
-           - if --no_zscore: plot raw energy
-           - else: plot z-scored energy (recommended for peak comparison)
+      3) Intersection time window + trimming (warmup/taildrop)
+      4) Interpolate both motion signals to unified time grid
+      5) Optional zscore plotting (raw or z-score)
       6) Optional event mask overlay (computed in z-score space)
-      7) Save plot
+      7) NEW: detect peaks (rgb/sig/joint) and map peaks back to nearest original RGB frame
+      8) Save plot + write rich JSON summary
     """
     # ---- RGB frames -> motion signal
-    rgb_frames = list_files_sorted_by_ts(rgb_dir, ".jpg")
+    rgb_frames = list_files_sorted_by_ts(rgb_dir, ".jpg", tz_name=args.rgb_tz)
     if len(rgb_frames) < 2:
         raise RuntimeError(f"No/too few RGB frames in: {rgb_dir}")
+
+    # Full RGB timeline origin (run start)
+    rgb_run_start_epoch = float(rgb_frames[0][0])
 
     t_rgb, m_rgb = compute_rgb_motion(
         rgb_frames,
@@ -555,7 +790,7 @@ def process_one_run_plot(
             f"(min_overlap_s={args.min_overlap_s}, warmup_s={warmup_s}, taildrop_s={taildrop_s})"
         )
 
-    # ---- Unified time grid
+    # ---- Unified time grid (epoch seconds)
     t_grid = np.arange(t_start, t_end, args.grid_dt, dtype=np.float64)
     if len(t_grid) < args.min_grid_n:
         raise RuntimeError(
@@ -566,11 +801,11 @@ def process_one_run_plot(
     rgb_g = interp_to_grid(t_rgb, m_rgb, t_grid)
     sig_g = interp_to_grid(t_sig, m_sig, t_grid)
 
-    # ---- Decide what to plot
-    # We compute z-scores anyway if you want event mask
+    # ---- Compute z-score curves (we always compute them for gating/peaks)
     rgb_z = zscore(rgb_g)
     sig_z = zscore(sig_g)
 
+    # ---- Decide what to plot (existing behavior)
     if args.no_zscore:
         rgb_plot = rgb_g
         sig_plot = sig_g
@@ -580,7 +815,7 @@ def process_one_run_plot(
         sig_plot = sig_z
         ylabel = "Motion energy (z-score)"
 
-    # ---- Optional event mask overlay (computed in z-score space)
+    # ---- Optional event mask overlay (existing behavior)
     mask_evt = None
     evt_meta = {"event_count": None, "event_ratio": None}
     if args.plot_event_mask:
@@ -593,6 +828,111 @@ def process_one_run_plot(
             "event_count": float(mask_evt.sum()),
             "event_ratio": float(mask_evt.mean()),
         }
+
+    # =========================
+    # NEW: Peak detection
+    # =========================
+    # Time axis in seconds since trimmed start (handy for plot and min_distance)
+    x_trim = t_grid - t_grid[0]
+
+    # valid mask for peak candidates:
+    # - if --peaks_require_event_mask: only search peaks where event mask True
+    # - else: consider all points
+    if args.peaks_require_event_mask:
+        # if user requires event mask but plot_event_mask wasn't enabled, we still build it here
+        _mask_evt_for_peaks = build_event_mask(
+            rgb_z, sig_z, event_z=args.event_z, dilate_bins=args.event_dilate_bins
+        )
+        valid_mask = _mask_evt_for_peaks
+    else:
+        valid_mask = np.ones_like(rgb_z, dtype=bool)
+
+    # Choose peak detection curve space:
+    # - use z-score curves (recommended) regardless of plotting choice
+    y_rgb_for_peaks = rgb_z
+    y_sig_for_peaks = sig_z
+
+    peaks_rgb_idx = []
+    peaks_sig_idx = []
+    peaks_joint_idx = []
+
+    if args.find_peaks_rgb:
+        peaks_rgb_idx = find_local_peaks_1d(
+            y=y_rgb_for_peaks, x=x_trim,
+            min_height=args.peak_min_z,
+            min_prominence=args.peak_min_prom,
+            min_distance_s=args.peak_min_dist_s,
+            max_peaks=args.peak_max_n,
+            valid_mask=valid_mask,
+        )
+
+    if args.find_peaks_sig:
+        peaks_sig_idx = find_local_peaks_1d(
+            y=y_sig_for_peaks, x=x_trim,
+            min_height=args.peak_min_z,
+            min_prominence=args.peak_min_prom,
+            min_distance_s=args.peak_min_dist_s,
+            max_peaks=args.peak_max_n,
+            valid_mask=valid_mask,
+        )
+
+    if args.find_peaks_joint:
+        # joint peaks: peaks on (rgb_z + sig_z) / 2, still under the same valid_mask
+        y_joint = 0.5 * (y_rgb_for_peaks + y_sig_for_peaks)
+        peaks_joint_idx = find_local_peaks_1d(
+            y=y_joint, x=x_trim,
+            min_height=args.peak_min_z,
+            min_prominence=args.peak_min_prom,
+            min_distance_s=args.peak_min_dist_s,
+            max_peaks=args.peak_max_n,
+            valid_mask=valid_mask,
+        )
+
+    # Convert peak indices to rich records with nearest RGB frame mapping
+    peaks_rgb = build_peak_records(
+        kind="rgb",
+        peak_indices=peaks_rgb_idx,
+        t_grid=t_grid,
+        x_trim=x_trim,
+        y_used=y_rgb_for_peaks,
+        rgb_frames=rgb_frames,
+        rgb_run_start_epoch=rgb_run_start_epoch,
+        t_trim_start_epoch=float(t_grid[0]),
+    )
+    peaks_sig = build_peak_records(
+        kind="sig",
+        peak_indices=peaks_sig_idx,
+        t_grid=t_grid,
+        x_trim=x_trim,
+        y_used=y_sig_for_peaks,
+        rgb_frames=rgb_frames,
+        rgb_run_start_epoch=rgb_run_start_epoch,
+        t_trim_start_epoch=float(t_grid[0]),
+    )
+    # for joint peaks, store y_peak from y_joint (not from rgb/sig)
+    peaks_joint = []
+    if args.find_peaks_joint and peaks_joint_idx:
+        y_joint = 0.5 * (y_rgb_for_peaks + y_sig_for_peaks)
+        peaks_joint = build_peak_records(
+            kind="joint",
+            peak_indices=peaks_joint_idx,
+            t_grid=t_grid,
+            x_trim=x_trim,
+            y_used=y_joint,
+            rgb_frames=rgb_frames,
+            rgb_run_start_epoch=rgb_run_start_epoch,
+            t_trim_start_epoch=float(t_grid[0]),
+        )
+
+    # Optional: annotate *some* peaks on plot (avoid clutter by using joint or rgb peaks)
+    peak_xs_for_plot = None
+    if args.annotate_peaks_on_plot:
+        # Priority: joint peaks, else rgb peaks, else sig peaks
+        idxs = peaks_joint_idx if peaks_joint_idx else (peaks_rgb_idx if peaks_rgb_idx else peaks_sig_idx)
+        if idxs:
+            # keep only first N for visualization
+            idxs = idxs[: min(len(idxs), args.annotate_peaks_max_n)]
+            peak_xs_for_plot = [float(x_trim[i]) for i in idxs]
 
     # ---- Plot
     out_png = out_dir / "plots" / f"{run_name}__armband__{side}.png"
@@ -608,6 +948,12 @@ def process_one_run_plot(
             f"zscore={'off' if args.no_zscore else 'on'} | "
             f"warmup={warmup_s:.1f}s taildrop={taildrop_s:.1f}s"
         ),
+        rgb_run_start_epoch=rgb_run_start_epoch,
+        add_top_axis_rgb=bool(args.top_axis_rgb_time),
+        add_top_axis_datetime=bool(args.top_axis_show_datetime),
+        annotate_peaks=bool(args.annotate_peaks_on_plot),
+        peak_xs=peak_xs_for_plot,
+        top_axis_tick_s=args.top_axis_tick_s
     )
 
     return {
@@ -645,26 +991,51 @@ def process_one_run_plot(
         "event_dilate_bins": int(args.event_dilate_bins),
         **evt_meta,
 
+        # NEW: mapping back to full RGB timeline
+        "rgb_run_start_epoch": float(rgb_run_start_epoch),
+        "rgb_run_start_timestr": epoch_to_timestr(rgb_run_start_epoch),
+        "trim_start_offset_from_rgb_s": float(t_start - rgb_run_start_epoch),
+        "trim_end_offset_from_rgb_s": float(t_end - rgb_run_start_epoch),
+
         # armband feature params
         "armband_smooth_emg": float(args.armband_smooth_emg),
         "armband_smooth_imu": float(args.armband_smooth_imu),
         "armband_emg_hpf_like": bool(not args.armband_emg_no_hpf),
         "imu_use_energy": bool(not args.imu_no_energy),
+
+        # NEW: peak parameters + outputs
+        "peaks": {
+            "enabled": True,
+            "peaks_require_event_mask": bool(args.peaks_require_event_mask),
+            "peak_min_z": float(args.peak_min_z),
+            "peak_min_prom": float(args.peak_min_prom),
+            "peak_min_dist_s": float(args.peak_min_dist_s),
+            "peak_max_n": int(args.peak_max_n),
+            "find_peaks_rgb": bool(args.find_peaks_rgb),
+            "find_peaks_sig": bool(args.find_peaks_sig),
+            "find_peaks_joint": bool(args.find_peaks_joint),
+            "n_peaks_rgb": int(len(peaks_rgb)),
+            "n_peaks_sig": int(len(peaks_sig)),
+            "n_peaks_joint": int(len(peaks_joint)),
+            "peaks_rgb": peaks_rgb,
+            "peaks_sig": peaks_sig,
+            "peaks_joint": peaks_joint,
+        }
     }
 
 
 # =========================
 # Per-subject processing
 # =========================
-def get_subject_out_dir(subject_root: Path, out_root: Optional[Path]) -> Path:
+def get_subject_out_dir(subject_root: Path, out_root: Optional[Path], out_folder) -> Path:
     """
     Output layout:
-      - if out_root is None: <subject_root>/_sync_out_emg
-      - else: out_root/<subject_name>/_sync_out_emg
+      - if out_root is None: <subject_root>/<out_folder>
+      - else: out_root/<subject_name>/<out_folder>
     """
     if out_root is None:
-        return subject_root / "_sync_out_emg"
-    return out_root / subject_root.name / "_sync_out_emg"
+        return subject_root / out_folder
+    return out_root / subject_root.name / out_folder
 
 
 def process_one_subject(subject_root: Path, args) -> None:
@@ -683,7 +1054,7 @@ def process_one_subject(subject_root: Path, args) -> None:
         return
 
     out_root = Path(args.out_root) if args.out_root else None
-    out_dir = get_subject_out_dir(subject_root, out_root)
+    out_dir = get_subject_out_dir(subject_root, out_root, args.out_folder)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     out_jsonl = out_dir / "run_plots.jsonl"
@@ -746,7 +1117,7 @@ def process_one_subject(subject_root: Path, args) -> None:
             try:
                 res_l = process_one_run_plot(run_name, rgb_dir, left_csv, out_dir, "left", args)
                 per_run_summary["left"] = res_l
-                print(f"  -> LEFT  plot={Path(res_l['plot_path']).name}")
+                print(f"  -> LEFT  plot={Path(res_l['plot_path']).name} peaks(joint)={res_l['peaks']['n_peaks_joint']}")
             except Exception as e:
                 per_run_summary["left"] = {"error": str(e), "armband_csv": str(left_csv)}
                 print(f"  !! LEFT failed: {e}")
@@ -756,7 +1127,7 @@ def process_one_subject(subject_root: Path, args) -> None:
             try:
                 res_r = process_one_run_plot(run_name, rgb_dir, right_csv, out_dir, "right", args)
                 per_run_summary["right"] = res_r
-                print(f"  -> RIGHT plot={Path(res_r['plot_path']).name}")
+                print(f"  -> RIGHT plot={Path(res_r['plot_path']).name} peaks(joint)={res_r['peaks']['n_peaks_joint']}")
             except Exception as e:
                 per_run_summary["right"] = {"error": str(e), "armband_csv": str(right_csv)}
                 print(f"  !! RIGHT failed: {e}")
@@ -782,6 +1153,10 @@ def main():
         "--subject_roots", type=str, nargs="+", required=True,
         help=r"One or more subject roots, e.g. D:\...\_raw_data_structured\MR D:\...\_raw_data_structured\N"
     )
+
+    ap.add_argument("--rgb_tz", type=str, default="Europe/London",
+                help="Timezone used to interpret RGB filename timestamps (default: Europe/London). "
+                     "Try UTC if your filenames are in UTC.")
 
     ap.add_argument("--camera_id", type=str, default="001431512812")
     ap.add_argument("--rgb_subdir", type=str, default="frames_rgb_blured",
@@ -813,7 +1188,7 @@ def main():
     # trimming inside intersection
     ap.add_argument("--warmup_s", type=float, default=10.0,
                     help="Drop warm-up seconds AFTER intersection start")
-    ap.add_argument("--taildrop_s", type=float, default=3.0,
+    ap.add_argument("--taildrop_s", type=float, default=6.0,
                     help="Drop tail seconds BEFORE intersection end (e.g., 1~5). Default 0.")
 
     ap.add_argument("--min_overlap_s", type=float, default=8.0,
@@ -826,18 +1201,65 @@ def main():
                     help="Plot RAW energy instead of z-scored energy (zscore recommended for peak comparison).")
 
     # event mask overlay
-    ap.add_argument("--event_z", type=float, default=0.3,
-                    help="Event threshold on z-scored signals (both must exceed). Only affects mask overlay.")
+    ap.add_argument("--event_z", type=float, default=0.8,
+                    help="Event threshold on z-scored signals (both must exceed). Only affects mask overlay / peak gating.")
     ap.add_argument("--event_dilate_bins", type=int, default=2,
                     help="Dilate event mask by N bins on each side to connect events")
     ap.add_argument("--plot_event_mask", action="store_true",
                     help="Overlay event mask band on plots")
 
+    # ---------- NEW: top axis mapping ----------
+    ap.add_argument(
+        "--top_axis_rgb_time", action="store_true",
+        help="Add a TOP x-axis showing time since RGB run start (full RGB timeline). "
+             "Bottom axis remains time since trimmed start (original behavior)."
+    )
+    ap.add_argument(
+        "--top_axis_show_datetime", action="store_true",
+        help="If --top_axis_rgb_time is set, also show approximate wall-clock datetime labels (sparse)."
+    )
+
+    ap.add_argument("--top_axis_tick_s", type=float, default=2.0,
+                help="Tick spacing (seconds) for TOP x-axis.")
+
+    # ---------- NEW: peak detection ----------
+    ap.add_argument("--find_peaks_rgb", action="store_true",
+                    help="Detect peaks on RGB z-score curve (inside trimmed window).")
+    ap.add_argument("--find_peaks_sig", action="store_true",
+                    help="Detect peaks on Armband z-score curve (inside trimmed window).")
+    ap.add_argument("--find_peaks_joint", action="store_true",
+                    help="Detect peaks on joint curve 0.5*(rgb_z + sig_z) (inside trimmed window).")
+
+    # default behavior: find joint peaks (most useful), and also rgb peaks
+    ap.set_defaults(find_peaks_rgb=True, find_peaks_sig=False, find_peaks_joint=True)
+
+    ap.add_argument("--peaks_require_event_mask", action="store_true",
+                    help="Only search peaks where BOTH rgb_z and sig_z exceed event_z (gated by event mask).")
+
+    ap.add_argument("--peak_min_z", type=float, default=1.0,
+                    help="Peak min height in z-score space (lower -> more peaks).")
+    ap.add_argument("--peak_min_prom", type=float, default=0.35,
+                    help="Peak min prominence (rough) in z-score space (lower -> more peaks).")
+    ap.add_argument("--peak_min_dist_s", type=float, default=0.35,
+                    help="Minimum time distance between peaks (seconds).")
+    ap.add_argument("--peak_max_n", type=int, default=25,
+                    help="Maximum number of peaks per curve to keep.")
+
+    ap.add_argument("--annotate_peaks_on_plot", action="store_true",
+                    help="Draw vertical lines at detected peaks (to help eyeballing).")
+    ap.add_argument("--annotate_peaks_max_n", type=int, default=10,
+                    help="Max number of peak lines to draw on plot (avoid clutter).")
+
     # output routing
     ap.add_argument(
         "--out_root", type=str, default=None,
-        help="If set: outputs go to out_root/<subject_name>/_sync_out_emg. "
-             "Otherwise: <subject_root>/_sync_out_emg"
+        help="If set: outputs go to out_root/<subject_name>/<out_folder>. "
+             "Otherwise: <subject_root>/<out_folder>"
+    )
+    ap.add_argument(
+        "--out_folder", type=str, default="_sync_out_emg",
+        help="If set: outputs go to out_root/<subject_name>/<out_folder>. "
+             "Otherwise: <subject_root>/<out_folder>"
     )
 
     # run filter
