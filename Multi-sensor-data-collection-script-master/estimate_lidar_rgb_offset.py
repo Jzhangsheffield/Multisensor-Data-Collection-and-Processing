@@ -8,45 +8,68 @@ using motion-energy signals derived from:
 - LiDAR: distance-histogram difference (robust) and/or centroid speed and/or point count change
   (also midpoint timestamp between consecutive LiDAR frames)
 
-Input layout (example):
-RGB:
-  ...\\kinect\\run_1\\001431512812\\frames_rgb_blured\\20251105_180412_789655.jpg
+✅ This FULL VERSION adds:
+  1) Per-run parallel processing via ProcessPoolExecutor (--jobs)
+  2) Safe JSONL writing ONLY in the main process (avoid file corruption)
+  3) Optional timezone-aware parsing for filename timestamps (--ts_tz)
+     - Default is "naive" behavior (keeps your old result)
+     - If you need DST-safe behavior, set: --ts_tz Europe/London or --ts_tz UTC
 
-LiDAR:
-  ...\\vlp16\\run_1\\20251105_172532\\20251105_180412_686366_cloud.csv
+Output per subject:
+- <out_dir>/plots/<run_name>__<lidar_session>__<lidar_feature>.png
+- <out_dir>/run_offsets.json      : summary list (written at end)
+- <out_dir>/run_offsets.jsonl     : one JSON per run (append as each run finishes)
 
-CSV columns: x, y, z, intensity
-Many rows can be all-zeros due to angular crop -> filtered.
-
-Per-subject outputs (each subject into its own folder):
-- <subject_out_dir>/plots/<run_name>__<lidar_session>__<lidar_feature>.png
-- <subject_out_dir>/run_offsets.json      : summary list (written at end)
-- <subject_out_dir>/run_offsets.jsonl     : one JSON per run (append; written immediately after each run)
+Windows notes:
+- Must run under "if __name__ == '__main__':" for multiprocessing.
+- Worker must be top-level function (pickleable).
 """
 
 import argparse
 import json
 import re
+import os
 from pathlib import Path
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import numpy as np
 import cv2
+
+# ---- Use non-GUI backend for safety (especially on Windows / servers) ----
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Optional tz parsing support (Python 3.9+)
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
-TS_RE = re.compile(r"(\d{8}_\d{6}_\d{6})")  # YYYYMMDD_HHMMSS_micro
+
+# ======================================================================
+# 0) Timestamp parsing from filenames
+# ======================================================================
+
+TS_RE = re.compile(r"(\d{8}_\d{6}_\d{6})")  # substring: YYYYMMDD_HHMMSS_micro
 
 
-# -------------------------- time parsing --------------------------
-def parse_ts_from_name(name: str) -> Optional[float]:
+def parse_ts_from_name(name: str, tz_name: Optional[str] = None) -> Optional[float]:
     """
     Parse 'YYYYMMDD_HHMMSS_micro' from filename and return "epoch seconds" as float.
 
-    IMPORTANT (Windows):
-      datetime.timestamp() can raise OSError for certain ranges.
-      So we compute (dt - epoch).total_seconds() which is Windows-safe.
+    IMPORTANT:
+      - If tz_name is None:
+          We keep the original behavior: naive datetime, then (dt - epoch).total_seconds().
+          This is "Windows-safe" and matches your old script exactly, BUT it treats the
+          filename timestamp as if it were in an unspecified time base (often ends up
+          equivalent to "UTC naive").
+      - If tz_name is provided (e.g. 'Europe/London' or 'UTC'):
+          We interpret the filename timestamp as local time in that timezone, and then
+          use dt.timestamp() to get true epoch seconds (DST-aware).
 
     Returns:
       float epoch seconds, or None if cannot parse.
@@ -60,40 +83,49 @@ def parse_ts_from_name(name: str) -> Optional[float]:
     except Exception:
         return None
 
+    if tz_name:
+        if ZoneInfo is None:
+            raise RuntimeError("zoneinfo is not available, cannot use --ts_tz")
+        # Interpret filename as "local time in tz_name", then convert to epoch.
+        dt = dt.replace(tzinfo=ZoneInfo(tz_name))
+        return float(dt.timestamp())
+
+    # Original behavior (no tz)
     epoch = datetime(1970, 1, 1)
-    return (dt - epoch).total_seconds()
+    return float((dt - epoch).total_seconds())
 
 
-def list_files_sorted_by_ts(folder: Path, suffix: str) -> List[Tuple[float, Path]]:
+def list_files_sorted_by_ts(folder: Path, suffix: str, tz_name: Optional[str]) -> List[Tuple[float, Path]]:
     """
     List files in folder matching suffix, parse timestamps from filenames,
     drop invalid/bogus timestamps (e.g., 1970), return sorted by time.
 
-    We filter out any timestamp earlier than 2010-01-01 to remove bogus frames like:
-      19700101_010000_000000.jpg
+    Filter: timestamps earlier than 2010-01-01 are treated as bogus.
     """
     items: List[Tuple[float, Path]] = []
     for p in folder.glob(f"*{suffix}"):
-        t = parse_ts_from_name(p.name)
+        t = parse_ts_from_name(p.name, tz_name=tz_name)
         if t is None or not np.isfinite(t):
             continue
-
-        # Filter bogus epoch-like timestamps
-        if t < 1262304000.0:  # 2010-01-01 00:00:00
+        if t < 1262304000.0:  # 2010-01-01
             continue
-
-        items.append((t, p))
+        items.append((float(t), p))
 
     items.sort(key=lambda x: x[0])
     return items
 
 
-# -------------------------- signal utils --------------------------
+# ======================================================================
+# 1) Signal utilities
+# ======================================================================
+
 def zscore(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     """Standard z-score normalization (mean/std)."""
     x = np.asarray(x, dtype=np.float64)
-    mu = x.mean() if x.size else 0.0
-    sd = x.std() if x.size else 1.0
+    if x.size == 0:
+        return x
+    mu = float(x.mean())
+    sd = float(x.std())
     if sd < eps:
         return x * 0.0
     return (x - mu) / (sd + eps)
@@ -109,7 +141,6 @@ def moving_average(x: np.ndarray, win: int) -> np.ndarray:
         return x
     win = int(win)
 
-    # pad_left + pad_right = win - 1
     pad_left = (win - 1) // 2
     pad_right = (win - 1) - pad_left
 
@@ -117,28 +148,21 @@ def moving_average(x: np.ndarray, win: int) -> np.ndarray:
     kernel = np.ones(win, dtype=np.float64) / win
     y = np.convolve(xp, kernel, mode="valid")  # length == len(x)
 
-    # safety
     if y.shape[0] != x.shape[0]:
-        y = y[:x.shape[0]]
+        y = y[: x.shape[0]]
     return y
 
 
 def interp_to_grid(t: np.ndarray, v: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
-    """
-    Interpolate samples (t, v) onto a unified time grid (t_grid).
-    Out-of-range is clamped to boundary values via np.clip.
-    """
+    """Interpolate samples (t, v) onto a unified time grid (t_grid), clamping out-of-range."""
     if len(t) < 2:
         return np.zeros_like(t_grid, dtype=np.float64)
-    tmin, tmax = t[0], t[-1]
-    vg = np.interp(np.clip(t_grid, tmin, tmax), t, v)
-    return vg
+    tmin, tmax = float(t[0]), float(t[-1])
+    return np.interp(np.clip(t_grid, tmin, tmax), t, v)
 
 
 def corr_at_shift(a: np.ndarray, b: np.ndarray) -> float:
-    """
-    Correlation coefficient between same-length arrays a and b.
-    """
+    """Correlation coefficient between same-length arrays a and b."""
     if a.size == 0 or b.size == 0:
         return -1.0
     aa = a - a.mean()
@@ -168,14 +192,14 @@ def estimate_offset_by_scan(
     best_delta = 0.0
     best_corr = -1e9
 
-    tmin, tmax = tg[0], tg[-1]
+    tmin, tmax = float(tg[0]), float(tg[-1])
+    dt_grid = float(tg[1] - tg[0]) if len(tg) >= 2 else 0.01
+    min_need = max(50, int(0.5 / max(dt_grid, 1e-6)))
 
     for d in deltas:
         # Overlap region when shifting LiDAR by d
         mask = (tg + d >= tmin) & (tg + d <= tmax)
-
-        # Need enough overlap, at least ~0.5 seconds worth of samples
-        if mask.sum() < max(50, int(0.5 / (tg[1] - tg[0]))):
+        if int(mask.sum()) < min_need:
             continue
 
         a = rgb_g[mask]
@@ -183,13 +207,16 @@ def estimate_offset_by_scan(
         c = corr_at_shift(a, b)
 
         if c > best_corr:
-            best_corr = c
+            best_corr = float(c)
             best_delta = float(d)
 
-    return best_delta, float(best_corr)
+    return float(best_delta), float(best_corr)
 
 
-# -------------------------- RGB motion signal --------------------------
+# ======================================================================
+# 2) RGB motion signal
+# ======================================================================
+
 def compute_rgb_motion(
     frames: List[Tuple[float, Path]],
     down_w: int = 160,
@@ -198,15 +225,12 @@ def compute_rgb_motion(
     smooth_win_s: float = 0.2,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute RGB motion signal from consecutive RGB frames.
+    RGB motion energy between consecutive frames:
+      motion = mean(absdiff(gray(frame[i+1]), gray(frame[i])))
+      timestamp = midpoint (t_i, t_{i+1})
 
-    Returns:
-      t_mid: midpoint timestamps between frame i and i+1
-      m_rgb: motion magnitude (mean abs diff, or thresholded ratio)
-
-    NOTE:
-      Since this is an "edge" measure between frames,
-      midpoint timestamp is the best aligned time for the measurement.
+    If diff_threshold > 0:
+      motion = fraction of pixels whose absdiff > diff_threshold
     """
     if len(frames) < 2:
         return np.array([]), np.array([])
@@ -217,9 +241,7 @@ def compute_rgb_motion(
         raise RuntimeError(f"Failed to read image: {p0}")
     im0 = cv2.resize(im0, (down_w, down_h), interpolation=cv2.INTER_AREA)
 
-    t_mid = []
-    m = []
-
+    t_mid, m = [], []
     for (t1, p1) in frames[1:]:
         im1 = cv2.imread(str(p1), cv2.IMREAD_GRAYSCALE)
         if im1 is None:
@@ -227,13 +249,9 @@ def compute_rgb_motion(
         im1 = cv2.resize(im1, (down_w, down_h), interpolation=cv2.INTER_AREA)
 
         d = cv2.absdiff(im1, im0).astype(np.float32)
+        val = float((d > diff_threshold).mean()) if diff_threshold > 0 else float(d.mean())
 
-        if diff_threshold > 0:
-            val = float((d > diff_threshold).mean())
-        else:
-            val = float(d.mean())
-
-        t_mid.append(0.5 * (t0 + t1))
+        t_mid.append(0.5 * (float(t0) + float(t1)))
         m.append(val)
 
         t0, im0 = t1, im1
@@ -241,26 +259,27 @@ def compute_rgb_motion(
     t_mid = np.asarray(t_mid, dtype=np.float64)
     m = np.asarray(m, dtype=np.float64)
 
-    # Smooth while preserving length
     if len(t_mid) >= 3 and smooth_win_s > 0:
-        dt = np.median(np.diff(t_mid))
-        win = max(1, int(round(smooth_win_s / dt)))
+        dt = float(np.median(np.diff(t_mid)))
+        win = max(1, int(round(smooth_win_s / max(dt, 1e-6))))
         m = moving_average(m, win)
 
     return t_mid, m
 
 
-# -------------------------- LiDAR motion signal --------------------------
+# ======================================================================
+# 3) LiDAR motion signal
+# ======================================================================
+
 def load_lidar_points_csv(csv_path: Path) -> np.ndarray:
     """
     Load LiDAR CSV with columns x,y,z,intensity.
     Filters out:
       - NaN rows
-      - all-zero rows (x=y=z=intensity=0)
-    Handles header/no-header.
+      - all-zero rows
 
-    Returns:
-      Nx4 float32 array
+    NOTE: np.genfromtxt is robust but slow; keep as-is for correctness.
+    If you want faster, replace with np.loadtxt or pandas.read_csv(usecols=[0,1,2,3]).
     """
     try:
         arr = np.genfromtxt(str(csv_path), delimiter=",", dtype=np.float32)
@@ -270,7 +289,7 @@ def load_lidar_points_csv(csv_path: Path) -> np.ndarray:
     if arr.ndim == 1:
         arr = arr.reshape(1, -1)
 
-    # If header caused issues, try skip_header
+    # If header caused issues, try skip_header=1
     if arr.shape[1] < 4:
         arr2 = np.genfromtxt(str(csv_path), delimiter=",", dtype=np.float32, skip_header=1)
         if arr2.ndim == 1:
@@ -300,10 +319,6 @@ def compute_lidar_motion(
     """
     Compute LiDAR motion signal from consecutive LiDAR frames.
 
-    Returns:
-      t_mid: midpoint timestamps between LiDAR frame i and i+1
-      m_lidar: motion magnitude (depending on feature)
-
     feature:
       - histdiff: L1 difference between distance histograms (robust)
       - centroid: centroid speed (norm(c1-c0) / dt)
@@ -331,15 +346,13 @@ def compute_lidar_motion(
         else:
             raise ValueError(f"Unknown feature: {feature}")
 
-    feats = []
-    ts = []
+    feats, ts = [], []
     for t, p in frames:
         pts = load_lidar_points_csv(p)
         feats.append(frame_feat(pts))
-        ts.append(t)
+        ts.append(float(t))
 
-    t_mid = []
-    m = []
+    t_mid, m = [], []
     for i in range(1, len(frames)):
         f0 = feats[i - 1]
         f1 = feats[i]
@@ -367,14 +380,17 @@ def compute_lidar_motion(
     m = np.asarray(m, dtype=np.float64)
 
     if len(t_mid) >= 3 and smooth_win_s > 0:
-        dt = np.median(np.diff(t_mid))
-        win = max(1, int(round(smooth_win_s / dt)))
+        dt = float(np.median(np.diff(t_mid)))
+        win = max(1, int(round(smooth_win_s / max(dt, 1e-6))))
         m = moving_average(m, win)
 
     return t_mid, m
 
 
-# -------------------------- drift estimation --------------------------
+# ======================================================================
+# 4) Drift estimation (optional)
+# ======================================================================
+
 def estimate_drift_piecewise(
     tg: np.ndarray,
     rgb_g: np.ndarray,
@@ -387,19 +403,14 @@ def estimate_drift_piecewise(
     """
     Estimate drift by splitting timeline into windows and estimating offset per window,
     then fitting offset(T) = p*T + q.
-
-    Returns:
-      slope p, intercept q, and mean correlation across windows.
     """
-    t0, t1 = tg[0], tg[-1]
-    centers = []
-    offsets = []
-    corrs = []
+    t0, t1 = float(tg[0]), float(tg[-1])
+    centers, offsets, corrs = [], [], []
 
     t = t0
     while t + win_s <= t1 + 1e-9:
         mask = (tg >= t) & (tg <= t + win_s)
-        if mask.sum() < 200:
+        if int(mask.sum()) < 200:
             t += hop_s
             continue
         d, c = estimate_offset_by_scan(tg[mask], rgb_g[mask], lidar_g[mask], search_s, step_s)
@@ -424,7 +435,10 @@ def estimate_drift_piecewise(
     return {"slope": float(p), "intercept": float(q), "mean_corr": float(np.mean(corrs))}
 
 
-# -------------------------- plotting --------------------------
+# ======================================================================
+# 5) Plotting
+# ======================================================================
+
 def plot_alignment(
     out_png: Path,
     t_grid: np.ndarray,
@@ -433,10 +447,7 @@ def plot_alignment(
     best_delta: float,
     title: str,
 ):
-    """
-    Plot (z-scored) RGB and LiDAR motion signals on the unified grid,
-    plus LiDAR shifted by best_delta.
-    """
+    """Plot z-scored RGB and LiDAR motion signals on the unified grid, plus shifted LiDAR."""
     out_png.parent.mkdir(parents=True, exist_ok=True)
 
     plt.figure(figsize=(12, 6))
@@ -459,7 +470,10 @@ def plot_alignment(
     plt.close()
 
 
-# -------------------------- per-run processing --------------------------
+# ======================================================================
+# 6) Per-run processing (core)
+# ======================================================================
+
 def process_one_run(
     rgb_dir: Path,
     lidar_dir: Path,
@@ -474,24 +488,26 @@ def process_one_run(
     lidar_r_max: float,
     lidar_hist_bins: int,
     warmup_s: float,
+    tail_trim_s: float,
+    ts_tz: Optional[str],
 ) -> Dict:
     """
     Process one run:
       1) list RGB frames and LiDAR frames (sorted by timestamp, filtered)
       2) compute motion signals (RGB and LiDAR) with midpoint timestamps
       3) compute intersection time range
-      4) drop warm-up seconds AFTER intersection start
+      4) drop warm-up seconds AFTER intersection start + trim tail seconds
       5) interpolate both signals to unified time grid
       6) scan offset that maximizes correlation
       7) optional drift estimation
       8) save plot
       9) return a dict with results and metadata
     """
-    rgb_frames = list_files_sorted_by_ts(rgb_dir, ".jpg")
+    rgb_frames = list_files_sorted_by_ts(rgb_dir, ".jpg", tz_name=ts_tz)
     if not rgb_frames:
         raise RuntimeError(f"No RGB frames found in: {rgb_dir}")
 
-    lidar_frames = list_files_sorted_by_ts(lidar_dir, ".csv")
+    lidar_frames = list_files_sorted_by_ts(lidar_dir, ".csv", tz_name=ts_tz)
     lidar_frames = [(t, p) for (t, p) in lidar_frames if p.name.endswith("_cloud.csv")]
     if not lidar_frames:
         raise RuntimeError(f"No LiDAR CSV frames found in: {lidar_dir}")
@@ -511,26 +527,30 @@ def process_one_run(
     if len(t_rgb) < 10 or len(t_lidar) < 5:
         raise RuntimeError(f"Not enough motion samples. RGB={len(t_rgb)}, LiDAR={len(t_lidar)}")
 
-    if len(t_rgb) != len(m_rgb):
-        raise RuntimeError(f"RGB length mismatch: len(t_rgb)={len(t_rgb)} != len(m_rgb)={len(m_rgb)}")
-    if len(t_lidar) != len(m_lidar):
-        raise RuntimeError(f"LiDAR length mismatch: len(t_lidar)={len(t_lidar)} != len(m_lidar)={len(m_lidar)}")
-
     # 2) intersection time range
-    t_start0 = max(t_rgb[0], t_lidar[0])
-    t_end = min(t_rgb[-1], t_lidar[-1])
+    t_start0 = float(max(t_rgb[0], t_lidar[0]))
+    t_end0 = float(min(t_rgb[-1], t_lidar[-1]))
 
-    # 3) drop warm-up seconds AFTER intersection start
+    # 3) warmup + tail trim (both applied INSIDE intersection)
     t_start = t_start0 + float(max(0.0, warmup_s))
+    t_end = t_end0 - float(max(0.0, tail_trim_s))
 
-    if t_end - t_start < 5.0:
+    if t_end <= t_start:
         raise RuntimeError(
-            f"Overlap too short after warmup: {(t_end - t_start):.2f}s "
-            f"(raw_overlap={(t_end - t_start0):.2f}s, warmup_s={warmup_s:.2f}s)"
+            f"Invalid trimmed window: t_end<=t_start. "
+            f"intersection=[{t_start0:.3f},{t_end0:.3f}] warmup={warmup_s} tail_trim={tail_trim_s}"
+        )
+
+    if (t_end - t_start) < 5.0:
+        raise RuntimeError(
+            f"Overlap too short after warmup/tail trim: {(t_end - t_start):.2f}s "
+            f"(warmup_s={warmup_s:.2f}s, tail_trim_s={tail_trim_s:.2f}s)"
         )
 
     # 4) unified time grid
-    t_grid = np.arange(t_start, t_end, grid_dt, dtype=np.float64)
+    t_grid = np.arange(t_start, t_end, float(grid_dt), dtype=np.float64)
+    if len(t_grid) < 100:
+        raise RuntimeError(f"Too few grid points: {len(t_grid)} (grid_dt={grid_dt})")
 
     # 5) interpolate motion signals to grid
     rgb_g = interp_to_grid(t_rgb, zscore(m_rgb), t_grid)
@@ -538,12 +558,11 @@ def process_one_run(
 
     # 6) estimate offset
     best_delta, best_corr = estimate_offset_by_scan(
-        t_grid, rgb_g, lidar_g, search_s=search_s, step_s=step_s
+        t_grid, rgb_g, lidar_g, search_s=float(search_s), step_s=float(step_s)
     )
 
-    run_name = rgb_dir.parents[2].name      # .../kinect/run_x/<cam>/frames_rgb_blured
+    run_name = rgb_dir.parents[1].name      # .../kinect/run_x/<cam>/frames_rgb_blured
     lidar_session = lidar_dir.name          # .../vlp16/run_x/<session>
-
     out_png = out_dir / "plots" / f"{run_name}__{lidar_session}__{lidar_feature}.png"
 
     result: Dict = {
@@ -551,6 +570,7 @@ def process_one_run(
         "rgb_run": run_name,
         "lidar_run": run_name,
         "lidar_session": lidar_session,
+
         "rgb_dir": str(rgb_dir),
         "lidar_dir": str(lidar_dir),
         "plot_path": str(out_png),
@@ -567,11 +587,15 @@ def process_one_run(
         "step_s": float(step_s),
         "grid_dt": float(grid_dt),
         "warmup_s": float(warmup_s),
+        "tail_trim_s": float(tail_trim_s),
+
+        "ts_tz": None if not ts_tz else str(ts_tz),
 
         "t_start_intersection": float(t_start0),
+        "t_end_intersection": float(t_end0),
         "t_start_used": float(t_start),
         "t_end_used": float(t_end),
-        "overlap_raw_s": float(t_end - t_start0),
+        "overlap_raw_s": float(t_end0 - t_start0),
         "overlap_used_s": float(t_end - t_start),
 
         "best_delta_s": float(best_delta),
@@ -583,8 +607,8 @@ def process_one_run(
     if do_drift:
         drift = estimate_drift_piecewise(
             t_grid, rgb_g, lidar_g,
-            search_s=search_s, step_s=step_s,
-            win_s=drift_win_s, hop_s=drift_hop_s,
+            search_s=float(search_s), step_s=float(step_s),
+            win_s=float(drift_win_s), hop_s=float(drift_hop_s),
         )
         result["drift"] = drift
 
@@ -600,11 +624,18 @@ def process_one_run(
     return result
 
 
-# -------------------------- incremental JSONL writer --------------------------
+# ======================================================================
+# 7) Robust JSONL writer (main-process only!)
+# ======================================================================
+
 def append_jsonl(path: Path, obj: Dict):
     """
     Append one JSON object as a single line (JSONL).
-    This is robust against interruptions (Ctrl+C / crashes).
+
+    IMPORTANT:
+      - Only call this from the MAIN process.
+      - Do NOT let worker processes write to the same JSONL file concurrently.
+        (That can corrupt the output.)
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
@@ -612,13 +643,75 @@ def append_jsonl(path: Path, obj: Dict):
         f.flush()
 
 
-# -------------------------- subject processing --------------------------
+# ======================================================================
+# 8) Worker function (must be top-level for Windows multiprocessing)
+# ======================================================================
+
+def worker_process_one_run(job: Dict) -> Dict:
+    """
+    One run worker.
+    This must be top-level (not nested) so Windows can pickle it.
+
+    The worker:
+      - limits OpenCV internal threads to avoid CPU oversubscription
+      - calls process_one_run(...) and returns a result dict
+      - returns a dict with "error" key if something fails
+
+    job includes all needed paths and parameters in plain JSON-serializable types.
+    """
+    # Prevent OpenCV from using multiple threads inside each process.
+    # (Without this, 4 processes x 8 threads can destroy performance.)
+    try:
+        cv2.setNumThreads(0)
+    except Exception:
+        pass
+
+    try:
+        res = process_one_run(
+            rgb_dir=Path(job["rgb_dir"]),
+            lidar_dir=Path(job["lidar_dir"]),
+            out_dir=Path(job["out_dir"]),
+            lidar_feature=str(job["lidar_feature"]),
+            search_s=float(job["search_s"]),
+            step_s=float(job["step_s"]),
+            grid_dt=float(job["grid_dt"]),
+            do_drift=bool(job["do_drift"]),
+            drift_win_s=float(job["drift_win_s"]),
+            drift_hop_s=float(job["drift_hop_s"]),
+            lidar_r_max=float(job["lidar_r_max"]),
+            lidar_hist_bins=int(job["lidar_hist_bins"]),
+            warmup_s=float(job["warmup_s"]),
+            tail_trim_s=float(job["tail_trim_s"]),
+            ts_tz=job.get("ts_tz", None),
+        )
+        res["subject_root"] = str(job["subject_root"])
+        return res
+
+    except Exception as e:
+        return {
+            "subject_root": str(job["subject_root"]),
+            "run_name": str(job["run_name"]),
+            "rgb_dir": str(job["rgb_dir"]),
+            "lidar_dir": str(job["lidar_dir"]),
+            "error": str(e),
+        }
+
+
+# ======================================================================
+# 9) Per-subject driver (collect jobs, then run sequential/parallel)
+# ======================================================================
+
 def process_one_subject(subject_root: Path, args) -> None:
     """
     Process one subject root:
       - find runs under subject_root/kinect/run_*
       - match LiDAR under subject_root/vlp16/run_*/<session>
-      - process each run and write outputs to subject-specific out_dir
+      - build a job list
+      - run jobs:
+          - sequential if --jobs 1
+          - parallel if --jobs > 1
+      - write JSONL incrementally as each run finishes (main process only)
+      - write a final JSON summary at the end
     """
     kinect_root = subject_root / "kinect"
     vlp16_root = subject_root / "vlp16"
@@ -630,28 +723,21 @@ def process_one_subject(subject_root: Path, args) -> None:
         print(f"[SKIP subject] Missing: {vlp16_root}")
         return
 
-    # decide per-subject out_dir
+    # Decide output directory per subject
     if args.out_root:
-        subject_name = subject_root.name
-        out_dir = Path(args.out_root) / subject_name / "_sync_out"
+        out_dir = Path(args.out_root) / subject_root.name / args.out_folder
     else:
-        out_dir = subject_root / "_sync_out"
-
+        out_dir = subject_root / args.out_folder
     out_dir.mkdir(parents=True, exist_ok=True)
 
     out_jsonl = out_dir / "run_offsets.jsonl"
     out_json = out_dir / "run_offsets.json"
 
+    # Optional run filter
     only_run_set = set(args.only_run) if args.only_run else None
-
     def should_run(run_name: str) -> bool:
-        if only_run_set is None:
-            return True
-        return run_name in only_run_set
+        return True if only_run_set is None else (run_name in only_run_set)
 
-    results: List[Dict] = []
-
-    # run loop
     run_dirs = sorted([p for p in kinect_root.glob("run_*") if p.is_dir()])
     if not run_dirs:
         print(f"[SKIP subject] No run_* found under: {kinect_root}")
@@ -660,18 +746,24 @@ def process_one_subject(subject_root: Path, args) -> None:
     print(f"\n========== SUBJECT: {subject_root} ==========")
     print(f"Output -> {out_dir}")
 
+    # ----------------------------------------------------------
+    # Build job list
+    # ----------------------------------------------------------
+    jobs = []
     for run_dir in run_dirs:
         run_name = run_dir.name
         if not should_run(run_name):
             continue
 
+        # RGB folder
         rgb_dir = run_dir / args.camera_id / "frames_rgb_blured"
         if not rgb_dir.exists():
-            # 兼容：如果你某些 run 用 frames_rgb 而不是 frames_rgb_blured，可在这里加 fallback
+            # Optional fallback:
             # rgb_dir2 = run_dir / args.camera_id / "frames_rgb"
             # if rgb_dir2.exists(): rgb_dir = rgb_dir2
             continue
 
+        # LiDAR folder: subject_root/vlp16/run_x/<session>
         lidar_run_dir = vlp16_root / run_name
         if not lidar_run_dir.exists():
             continue
@@ -680,47 +772,88 @@ def process_one_subject(subject_root: Path, args) -> None:
         if not sessions:
             continue
         sessions.sort(key=lambda p: p.name)
-        lidar_dir = sessions[-1]
+        lidar_dir = sessions[-1]  # choose the latest by name sort
 
-        print(f"[{run_name}] RGB={rgb_dir} | LiDAR={lidar_dir}")
+        jobs.append({
+            "subject_root": str(subject_root),
+            "run_name": run_name,
+            "rgb_dir": str(rgb_dir),
+            "lidar_dir": str(lidar_dir),
+            "out_dir": str(out_dir),
 
-        try:
-            res = process_one_run(
-                rgb_dir=rgb_dir,
-                lidar_dir=lidar_dir,
-                out_dir=out_dir,
-                lidar_feature=args.lidar_feature,
-                search_s=args.search_s,
-                step_s=args.step_s,
-                grid_dt=args.grid_dt,
-                do_drift=args.do_drift,
-                drift_win_s=args.drift_win_s,
-                drift_hop_s=args.drift_hop_s,
-                lidar_r_max=args.lidar_r_max,
-                lidar_hist_bins=args.lidar_hist_bins,
-                warmup_s=args.warmup_s,
-            )
+            "lidar_feature": args.lidar_feature,
+            "search_s": args.search_s,
+            "step_s": args.step_s,
+            "grid_dt": args.grid_dt,
 
-            results.append(res)
+            "do_drift": args.do_drift,
+            "drift_win_s": args.drift_win_s,
+            "drift_hop_s": args.drift_hop_s,
+
+            "lidar_r_max": args.lidar_r_max,
+            "lidar_hist_bins": args.lidar_hist_bins,
+
+            "warmup_s": args.warmup_s,
+            "tail_trim_s": args.tail_trim_s,
+
+            "ts_tz": args.ts_tz if args.ts_tz else None,
+        })
+
+    if not jobs:
+        print(f"[SKIP subject] No runnable runs for: {subject_root}")
+        return
+
+    # ----------------------------------------------------------
+    # Execute jobs
+    # ----------------------------------------------------------
+    results: List[Dict] = []
+    n_workers = max(1, int(args.jobs))
+
+    if n_workers == 1:
+        # --------- Sequential (original behavior) ---------
+        for job in jobs:
+            print(f"[{job['run_name']}] RGB={job['rgb_dir']} | LiDAR={job['lidar_dir']}")
+            res = worker_process_one_run(job)
+
+            # Main process writes JSONL immediately
             append_jsonl(out_jsonl, res)
+            results.append(res)
 
-            print(f"  -> best_delta_s={res['best_delta_s']:+.3f}, corr={res['best_corr']:.3f}")
-            print(f"  -> plot: {res['plot_path']}")
+            if "error" in res:
+                print(f"  !! FAILED: {job['run_name']}: {res['error']}")
+            else:
+                print(f"  -> best_delta_s={res['best_delta_s']:+.3f}, corr={res['best_corr']:.3f}")
+                print(f"  -> plot: {res['plot_path']}")
 
-        except Exception as e:
-            err = {
-                "subject_root": str(subject_root),
-                "run_name": run_name,
-                "rgb_dir": str(rgb_dir),
-                "lidar_dir": str(lidar_dir),
-                "error": str(e),
-            }
-            append_jsonl(out_jsonl, err)
-            print(f"  !! FAILED: {run_name}: {e}")
-            continue
+    else:
+        # --------- Parallel (per-run) ---------
+        # NOTE: If your data is on HDD, too many workers can be slower.
+        print(f"[Parallel] workers={n_workers}, total_runs={len(jobs)}")
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            fut_to_job = {ex.submit(worker_process_one_run, job): job for job in jobs}
+
+            # as_completed yields futures as soon as they finish
+            for fut in as_completed(fut_to_job):
+                job = fut_to_job[fut]
+                res = fut.result()
+
+                # Main process writes JSONL immediately (safe)
+                append_jsonl(out_jsonl, res)
+                results.append(res)
+
+                if "error" in res:
+                    print(f"  !! FAILED: {job['run_name']}: {res['error']}")
+                else:
+                    print(f"  -> DONE {job['run_name']}: best_delta_s={res['best_delta_s']:+.3f}, corr={res['best_corr']:.3f}")
+
+    # ----------------------------------------------------------
+    # Write final summary JSON (list of results)
+    # ----------------------------------------------------------
+    # Sorting is optional. You can keep completion order, or sort by run_name:
+    results_sorted = sorted(results, key=lambda d: d.get("run_name", ""))
 
     with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+        json.dump(results_sorted, f, ensure_ascii=False, indent=2)
 
     print(f"\n[Subject done] {subject_root}")
     print(f"Saved summary JSON: {out_json}")
@@ -730,11 +863,13 @@ def process_one_subject(subject_root: Path, args) -> None:
         print(f"Only-runs filter used: {sorted(only_run_set)}")
 
 
-# -------------------------- main --------------------------
+# ======================================================================
+# 10) main
+# ======================================================================
+
 def main():
     ap = argparse.ArgumentParser()
 
-    # ✅ new: multiple subject roots
     ap.add_argument(
         "--subject_roots", type=str, nargs="+", required=True,
         help=r"One or more subject roots, e.g. D:\...\_raw_data_structured\N D:\...\_raw_data_structured\MR"
@@ -744,11 +879,13 @@ def main():
         "--camera_id", type=str, default="001431512812",
         help="Camera folder under kinect/run_x/<camera_id>/frames_rgb_blured"
     )
+
     ap.add_argument(
         "--lidar_feature", type=str, default="histdiff",
         choices=["histdiff", "centroid", "count"],
         help="LiDAR motion feature"
     )
+
     ap.add_argument("--search_s", type=float, default=2.0, help="Search range for offset in seconds (+/-)")
     ap.add_argument("--step_s", type=float, default=0.01, help="Scan step for offset in seconds")
     ap.add_argument("--grid_dt", type=float, default=0.01, help="Unified time grid dt in seconds")
@@ -757,32 +894,55 @@ def main():
     ap.add_argument("--drift_win_s", type=float, default=20.0)
     ap.add_argument("--drift_hop_s", type=float, default=10.0)
 
-    # ✅ new: global output root (optional)
     ap.add_argument(
         "--out_root", type=str, default=None,
-        help="If set, write outputs to out_root/<subject_name>/_sync_out. Otherwise per-subject <subject_root>/_sync_out"
+        help="If set, write outputs to out_root/<subject_name>/<out_folder>. Otherwise per-subject <subject_root>/<out_folder>"
+    )
+
+    ap.add_argument(
+        "--out_folder", type=str, default="_sync_out",
+        help="Output folder name inside each subject output directory"
     )
 
     ap.add_argument("--lidar_r_max", type=float, default=3.0)
     ap.add_argument("--lidar_hist_bins", type=int, default=40)
 
     ap.add_argument(
-        "--warmup_s", type=float, default=5.0,
-        help="Drop warm-up seconds AFTER intersection start (e.g., 1~3). Default 5."
+        "--warmup_s", type=float, default=8.0,
+        help="Drop warm-up seconds AFTER intersection start"
+    )
+
+    ap.add_argument(
+        "--tail_trim_s", type=float, default=0.0,
+        help="Trim last seconds from the intersection end"
     )
 
     ap.add_argument(
         "--only_run", nargs="*", default=None,
-        help="Only process specified run(s), e.g. --only_run run_10 or --only_run run_1 run_8-37"
+        help="Only process specified run(s), e.g. --only_run run_10 run_1 run_8-37"
+    )
+
+    # ✅ NEW: per-run parallelism
+    ap.add_argument(
+        "--jobs", type=int, default=3,
+        help="Number of parallel processes PER SUBJECT. 1 = no parallel. "
+             "If data is on HDD, try small values (2~4). If on SSD/NVMe, higher can help."
+    )
+
+    # ✅ NEW: timezone-aware parsing option
+    ap.add_argument(
+        "--ts_tz", type=str, default=None,
+        help="Timezone used to interpret filename timestamps (YYYYMMDD_HHMMSS_micro). "
+             "Default None keeps old naive behavior. Examples: Europe/London, UTC"
     )
 
     args = ap.parse_args()
 
-    # ensure out_root exists if provided
+    # Ensure global out_root exists if provided
     if args.out_root:
         Path(args.out_root).mkdir(parents=True, exist_ok=True)
 
-    # process each subject sequentially
+    # Process each subject sequentially (inside each subject we may parallelize runs)
     for s in args.subject_roots:
         subject_root = Path(s)
         if not subject_root.exists():
@@ -792,4 +952,9 @@ def main():
 
 
 if __name__ == "__main__":
+    # On Windows, you MUST protect multiprocessing entry point like this.
+    # Also: consider setting the start method explicitly if you run into issues.
+    # import multiprocessing
+    # multiprocessing.set_start_method("spawn", force=True)
+
     main()
