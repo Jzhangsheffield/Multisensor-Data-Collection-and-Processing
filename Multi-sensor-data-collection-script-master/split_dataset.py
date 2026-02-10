@@ -2,33 +2,45 @@
 # -*- coding: utf-8 -*-
 
 """
-split_dataset_grouped_by_run_with_hierarchy_coverage_unified_json_v5_structured_resolvers.py
+split_dataset_grouped_by_run_with_hierarchy_coverage_unified_json_v6_indexed.py
 
-Refactor based on your latest on-disk structure:
-
-Modalities:
-  - rgb / depth:
+✅ What this v6 does:
+  - SAME splitting logic as your previous version:
+      * records are grouped by run: group_uid = person::run_token
+      * random trials search to satisfy tier1 coverage across train/val/test (hard constraint)
+      * tier2/tier3 coverage + size balance (soft objective)
+  - NEW: Optimization A (fast):
+      * build a file index ONCE per modality (single filesystem traversal per modality)
+      * JSON generation uses O(1) dict lookup, no per-sample glob scanning
+  - RGB/Depth:
       <root>/<person>/<action>/<segment>/
           cam_001431512812/*.png
           cam_001484412812/*.png
+    JSON stores per-cam lists (cam split)
 
-  - mindrove:
-      <root>/<person>/<action>/<segment>_npy/   (may have _npy suffix)
-          left/*.npy   (prefer clip.npy)
-          right/*.npy  (prefer clip.npy)
+  - MindRove:
+      <root>/<person>/<action>/<segment>_npy/
+          left/*.npy  (prefer clip.npy)
+          right/*.npy (prefer clip.npy)
+    JSON stores dict: {"left": "...", "right": "..."} (only existing)
 
-  - lidar:
-      <root>/<person>/<action>/<segment>_npy/   (may have _npy suffix)
-          *.npy        (prefer clip.npy)
+  - LiDAR:
+      <root>/<person>/<action>/<segment>_npy/
+          *.npy (prefer clip.npy)
+    JSON stores a single npy path (string)
 
-Key requirements:
-  - split by run group: group_uid = person::run_token (no leakage across splits)
-  - tier1 must appear in ALL splits (hard constraint)
-  - output 3 JSONs: train.json / val.json / test.json
-      key = person/action/segment_base  (segment_base strips trailing _npy)
-      value = per-modality paths (rgb/depth list of png paths; mindrove dict left/right npy; lidar npy path)
+Key:
+  key = person/action/segment_base   (segment_base strips trailing "_npy")
+
+Output:
+  - manifest.csv
+  - run_split_map.csv
+  - tier{1,2,3}_split_counts.csv
+  - rare_actions_report.txt
+  - train.json / val.json / test.json
 """
 
+import os
 import re
 import csv
 import json
@@ -39,7 +51,7 @@ from collections import defaultdict, Counter
 from typing import Dict, List, Tuple, Optional, Set, Any
 
 
-# ------------------------- Defaults -------------------------
+# ------------------------- Defaults / constants -------------------------
 
 DEFAULT_PERSONS = ("N", "M", "MR", "J")
 
@@ -95,13 +107,11 @@ LIGHTS = ("normal", "right", "left")
 POSITIONS = ("elbow", "mid")
 SPLITS = ("train", "val", "test")
 
-# RGB/Depth camera folders under each segment
 DEFAULT_CAM_DIRS = ("cam_001431512812", "cam_001484412812")
-
 RUN_TOKEN_RE = re.compile(r"^run_(\d+(?:-\d+)?)", re.IGNORECASE)
 
 
-# ------------------------- String utils -------------------------
+# ------------------------- Small string utils -------------------------
 
 def norm_name(s: str) -> str:
     s = s.strip().lower().replace(" ", "_")
@@ -123,11 +133,14 @@ def is_subsequence(needle: List[str], hay: List[str]) -> bool:
     return False
 
 def strip_trailing_npy_suffix(seg_dirname: str) -> str:
-    """Remove ONLY a trailing '_npy' (case-insensitive) from segment folder name."""
+    """Remove ONLY trailing '_npy' (case-insensitive)."""
     s = seg_dirname.strip()
     if s.lower().endswith("_npy"):
         return s[:-4]
     return s
+
+def build_key(person: str, action_raw: str, segment_base: str) -> str:
+    return f"{person}/{action_raw}/{segment_base}"
 
 
 # ------------------------- Tier mapping -------------------------
@@ -204,7 +217,7 @@ class SegmentRecord:
     split: str = ""
 
 
-# ------------------------- Input parsing -------------------------
+# ------------------------- Arg helpers -------------------------
 
 def parse_modality_args(modality_args: List[str]) -> Dict[str, Path]:
     out: Dict[str, Path] = {}
@@ -219,51 +232,51 @@ def parse_modality_args(modality_args: List[str]) -> Dict[str, Path]:
         out[name] = Path(p)
     return out
 
-def detect_person_dir(mod_root: Path, person: str) -> Optional[Path]:
-    p = mod_root / person
-    if p.exists() and p.is_dir():
-        return p
-    return None
-
 def choose_canonical_modality(modality_parents: Dict[str, Path]) -> str:
-    """Prefer rgb; else pick first alphabetically."""
+    """Prefer rgb, else choose first alphabetically."""
     if "rgb" in modality_parents:
         return "rgb"
     return sorted(modality_parents.keys())[0]
 
 
-# ------------------------- Canonical scanning -------------------------
+# ------------------------- Canonical scan (fast: only directories) -------------------------
 
-def scan_canonical_from_modality(
-    canonical_mod_root: Path,
+def scan_canonical_records(
+    canonical_root: Path,
     persons: Tuple[str, ...],
 ) -> List[SegmentRecord]:
     """
-    Scan the structure (person/action/segment) from one canonical modality root.
-    We assume action/segment sets are consistent across modalities.
+    Scan (person/action/segment) from canonical modality root.
+    NOTE: This scan does NOT enumerate frames/npy files. It only walks directories.
     """
+    if not canonical_root.exists():
+        raise FileNotFoundError(f"Canonical root not found: {canonical_root}")
+
     tier2_norm = [norm_name(x) for x in TIER2_ACTIONS]
     records: List[SegmentRecord] = []
 
     for person in persons:
-        person_dir = detect_person_dir(canonical_mod_root, person)
-        if person_dir is None:
-            raise FileNotFoundError(f"Canonical root missing person folder: {canonical_mod_root}/{person}")
+        person_dir = canonical_root / person
+        if not person_dir.exists():
+            raise FileNotFoundError(f"Canonical root missing person folder: {person_dir}")
 
-        for action_dir in person_dir.iterdir():
-            if not action_dir.is_dir():
+        # list action folders
+        for action_entry in os.scandir(person_dir):
+            if not action_entry.is_dir():
                 continue
+            action_raw = action_entry.name
 
-            action_raw = action_dir.name
             tier3 = norm_name(action_raw)
             tier1 = norm_name(get_tier1_verb(tier3))
             tier2 = best_tier2_match(tier3, tier2_norm) or "UNMAPPED_T2"
 
-            for seg_dir in action_dir.iterdir():
-                if not seg_dir.is_dir():
-                    continue
+            action_dir = Path(action_entry.path)
 
-                seg_raw = seg_dir.name
+            # list segment folders
+            for seg_entry in os.scandir(action_dir):
+                if not seg_entry.is_dir():
+                    continue
+                seg_raw = seg_entry.name
                 seg_base = strip_trailing_npy_suffix(seg_raw)
 
                 run_token = extract_run_token(seg_base) or "run_UNKNOWN"
@@ -311,7 +324,7 @@ def group_sizes(groups: Dict[str, List[int]]) -> Dict[str, int]:
     return {gid: len(idxs) for gid, idxs in groups.items()}
 
 
-# ------------------------- Split search -------------------------
+# ------------------------- Split search (same logic) -------------------------
 
 def evaluate_assignment(
     assignment: Dict[str, str],
@@ -329,12 +342,13 @@ def evaluate_assignment(
         cov[sp]["tier2"].update(group_info[gid]["tier2"])
         cov[sp]["tier3"].update(group_info[gid]["tier3"])
 
-    # Hard constraint: tier1 must be fully covered in all splits
+    # Hard constraint: all tier1 verbs must appear in each split
     missing_t1_total = sum(len(all_t1 - cov[sp]["tier1"]) for sp in SPLITS)
     if missing_t1_total > 0:
         score = -1e12 - 1e9 * missing_t1_total
         return score, cov, split_counts
 
+    # Soft objective: maximize tier2 and tier3 coverage, penalize size deviation
     t2_score = sum(len(cov[sp]["tier2"]) for sp in SPLITS)
     t3_score = sum(len(cov[sp]["tier3"]) for sp in SPLITS)
     dev_pen = sum(abs(split_counts[sp] - target_counts[sp]) for sp in SPLITS)
@@ -400,7 +414,7 @@ def search_best_split(
     return best_assignment, best_cov, best_counts
 
 
-# ------------------------- Reports -------------------------
+# ------------------------- Reports / counts -------------------------
 
 def per_tier_split_counts(records: List[SegmentRecord]) -> Dict[str, Dict[str, Counter]]:
     out = {
@@ -446,231 +460,252 @@ def missing_labels_in_split(split_counter: Counter, all_labels: Set[str]) -> Lis
     return sorted([lab for lab in all_labels if split_counter.get(lab, 0) == 0])
 
 
-# ------------------------- File resolvers (structured, per modality) -------------------------
+# ------------------------- Index building (Optimization A) -------------------------
 
-def build_key(person: str, action_raw: str, segment_base: str) -> str:
-    return f"{person}/{action_raw}/{segment_base}"
-
-def segment_dir_candidates(mod_root: Path, person: str, action_raw: str, segment_base: str, allow_suffix_npy: bool) -> List[Path]:
+def pick_preferred_npy(npy_paths: List[str]) -> Optional[str]:
     """
-    Candidate segment folders:
-      - If allow_suffix_npy: try <segment_base>_npy then <segment_base>
-      - else: only <segment_base>
-    """
-    base = mod_root / person / action_raw
-    if allow_suffix_npy:
-        return [base / f"{segment_base}_npy", base / segment_base]
-    return [base / segment_base]
-
-def pick_preferred_npy(npy_paths: List[Path]) -> Optional[Path]:
-    """
-    Prefer clip.npy if present; else the first sorted.
+    Prefer clip.npy if present; else first sorted path.
+    Inputs are strings (full paths).
     """
     if not npy_paths:
         return None
-    clip = [p for p in npy_paths if p.name.lower() == "clip.npy"]
+    clip = [p for p in npy_paths if os.path.basename(p).lower() == "clip.npy"]
     if clip:
         return sorted(clip)[0]
     return sorted(npy_paths)[0]
 
-def resolve_rgb_or_depth_frames(
+def build_index_rgb_or_depth(
     mod_root: Path,
-    person: str,
-    action_raw: str,
-    segment_base: str,
+    persons: Tuple[str, ...],
     cam_dirs: Tuple[str, ...],
     frame_exts: Tuple[str, ...],
-) -> Tuple[Optional[Dict[str, List[str]]], Optional[str]]:
+) -> Dict[str, Dict[str, Any]]:
     """
-    RGB/Depth:
-      <seg>/<cam_xxx>/*.png
-
-    Return:
-      - files_dict: {cam_dir: [abs_png_paths...]}  (only cams that exist and have frames)
-      - seg_dir_abs: absolute segment dir path (the matched segment directory)
-
-    Notes:
-      - We DO NOT merge cameras here.
-      - If segment exists but all cams empty -> treated as missing.
-      - If only one cam exists/have frames -> returns only that cam key.
+    Build index for rgb/depth:
+      key -> {
+        "segment_dir": <abs segment dir>,
+        "files": {cam_dir: [abs_frame_paths...] }   (only cams with frames)
+      }
+    Only traverses expected depth:
+      mod_root/person/action/segment/cam/*.ext
     """
-    for seg_dir in segment_dir_candidates(mod_root, person, action_raw, segment_base, allow_suffix_npy=False):
-        if not seg_dir.exists() or not seg_dir.is_dir():
-            continue
+    index: Dict[str, Dict[str, Any]] = {}
 
-        files_by_cam: Dict[str, List[Path]] = {}
-        found_any = False
-
-        for cam in cam_dirs:
-            cam_path = seg_dir / cam
-            if not cam_path.exists() or not cam_path.is_dir():
-                continue
-
-            frames: List[Path] = []
-            for ext in frame_exts:
-                frames.extend(cam_path.glob(f"*.{ext}"))
-
-            frames = sorted(frames)
-            if frames:
-                files_by_cam[cam] = frames
-                found_any = True
-
-        if found_any:
-            # convert to abs paths (string)
-            out = {cam: [str(p.resolve()) for p in plist] for cam, plist in files_by_cam.items()}
-            return out, str(seg_dir.resolve())
-
-    return None, None
-
-
-def resolve_lidar_npy(
-    mod_root: Path,
-    person: str,
-    action_raw: str,
-    segment_base: str,
-    allow_suffix_npy: bool,
-) -> Tuple[Optional[str], Optional[str]]:
-    """
-    LiDAR:
-      <seg>/*.npy   (no left/right)
-    """
-    for seg_dir in segment_dir_candidates(mod_root, person, action_raw, segment_base, allow_suffix_npy=allow_suffix_npy):
-        if not seg_dir.exists() or not seg_dir.is_dir():
-            continue
-
-        npys = sorted(seg_dir.glob("*.npy"))
-        pick = pick_preferred_npy(npys)
-        if pick is not None:
-            return str(pick.resolve()), str(seg_dir.resolve())
-
-    return None, None
-
-def resolve_mindrove_npys(
-    mod_root: Path,
-    person: str,
-    action_raw: str,
-    segment_base: str,
-    allow_suffix_npy: bool,
-) -> Tuple[Optional[Dict[str, str]], Optional[str], List[str]]:
-    """
-    MindRove:
-      <seg>/left/*.npy
-      <seg>/right/*.npy
-    Returns:
-      (files_dict_or_none, seg_dir_abs_or_none, missing_hands)
-    where files_dict: {"left": "...", "right": "..."} (only existing)
-    """
-    for seg_dir in segment_dir_candidates(mod_root, person, action_raw, segment_base, allow_suffix_npy=allow_suffix_npy):
-        if not seg_dir.exists() or not seg_dir.is_dir():
-            continue
-
-        out: Dict[str, str] = {}
-        missing_hands: List[str] = []
-
-        for hand in ("left", "right"):
-            hand_dir = seg_dir / hand
-            if not hand_dir.exists() or not hand_dir.is_dir():
-                missing_hands.append(hand)
-                continue
-
-            npys = sorted(hand_dir.glob("*.npy"))
-            pick = pick_preferred_npy(npys)
-            if pick is None:
-                missing_hands.append(hand)
-            else:
-                out[hand] = str(pick.resolve())
-
-        # If at least one hand exists, we consider modality present
-        if out:
-            return out, str(seg_dir.resolve()), missing_hands
-
-    return None, None, ["left", "right"]
-
-
-def resolve_files_for_modality(
-    modality_name: str,
-    mod_root: Path,
-    person: str,
-    action_raw: str,
-    segment_base: str,
-    frame_exts: Tuple[str, ...],
-    cam_dirs: Tuple[str, ...],
-    suffix_modalities: Set[str],
-) -> Tuple[Optional[Any], Optional[str], Optional[Dict[str, Any]]]:
-    """
-    Unified resolver:
-      - rgb/depth -> list of frames + seg_dir
-      - mindrove  -> dict(left/right) + seg_dir + extra_info
-      - lidar     -> npy path + seg_dir
-    Returns:
-      (files_value, seg_dir_abs, extra_info)
-    """
     if not mod_root.exists():
-        return None, None, {"reason": "mod_root_missing"}
+        return index
 
-    allow_suffix_npy = modality_name in suffix_modalities
+    frame_exts_lc = tuple(e.lower() for e in frame_exts)
 
-    if modality_name in ("rgb", "depth"):
-        frames_by_cam, segdir = resolve_rgb_or_depth_frames(
-            mod_root=mod_root,
-            person=person,
-            action_raw=action_raw,
-            segment_base=segment_base,
-            cam_dirs=cam_dirs,
-            frame_exts=frame_exts,
-        )
-        if frames_by_cam is None:
-            return None, None, {"reason": "no_frames_found"}
-        return frames_by_cam, segdir, None
+    for person in persons:
+        person_dir = mod_root / person
+        if not person_dir.exists():
+            continue
 
-    if modality_name == "lidar":
-        npy, segdir = resolve_lidar_npy(
-            mod_root=mod_root,
-            person=person,
-            action_raw=action_raw,
-            segment_base=segment_base,
-            allow_suffix_npy=allow_suffix_npy,
-        )
-        if npy is None:
-            return None, None, {"reason": "no_npy_found"}
-        return npy, segdir, None
+        for action_entry in os.scandir(person_dir):
+            if not action_entry.is_dir():
+                continue
+            action_raw = action_entry.name
+            action_dir = Path(action_entry.path)
 
-    if modality_name == "mindrove":
-        md, segdir, missing_hands = resolve_mindrove_npys(
-            mod_root=mod_root,
-            person=person,
-            action_raw=action_raw,
-            segment_base=segment_base,
-            allow_suffix_npy=allow_suffix_npy,
-        )
-        if md is None:
-            return None, None, {"reason": "no_hand_npy_found", "missing_hands": missing_hands}
-        return md, segdir, {"missing_hands": missing_hands}
+            for seg_entry in os.scandir(action_dir):
+                if not seg_entry.is_dir():
+                    continue
+                seg_raw = seg_entry.name
+                seg_dir = Path(seg_entry.path)
 
-    # Fallback: treat unknown modality as "lidar-like": segment root contains npy
-    npy, segdir = resolve_lidar_npy(
-        mod_root=mod_root,
-        person=person,
-        action_raw=action_raw,
-        segment_base=segment_base,
-        allow_suffix_npy=allow_suffix_npy,
-    )
-    if npy is None:
-        return None, None, {"reason": "unknown_modality_no_npy"}
-    return npy, segdir, {"note": "unknown modality treated as lidar-like"}
+                seg_base = strip_trailing_npy_suffix(seg_raw)  # normally no _npy for rgb/depth, but safe
+                key = build_key(person, action_raw, seg_base)
+
+                files_by_cam: Dict[str, List[str]] = {}
+                for cam in cam_dirs:
+                    cam_path = seg_dir / cam
+                    if not cam_path.exists():
+                        continue
+                    frames: List[str] = []
+                    # scan files in cam folder
+                    for f in os.scandir(cam_path):
+                        if not f.is_file():
+                            continue
+                        # extension filter
+                        ext = os.path.splitext(f.name)[1].lstrip(".").lower()
+                        if ext in frame_exts_lc:
+                            frames.append(os.path.abspath(f.path))
+                    if frames:
+                        frames.sort()
+                        files_by_cam[cam] = frames
+
+                if files_by_cam:
+                    index[key] = {
+                        "segment_dir": str(seg_dir.resolve()),
+                        "files": files_by_cam,
+                    }
+
+    return index
+
+def build_index_mindrove(
+    mod_root: Path,
+    persons: Tuple[str, ...],
+    allow_suffix_npy: bool = True,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Build index for mindrove:
+      key -> {
+        "segment_dir": <abs segment dir>,
+        "files": {"left": <npy>, "right": <npy>}  (only hands that exist)
+        "missing_hands": [...]
+      }
+    Expected:
+      mod_root/person/action/segment[_npy]/left|right/*.npy
+    """
+    index: Dict[str, Dict[str, Any]] = {}
+    if not mod_root.exists():
+        return index
+
+    for person in persons:
+        person_dir = mod_root / person
+        if not person_dir.exists():
+            continue
+
+        for action_entry in os.scandir(person_dir):
+            if not action_entry.is_dir():
+                continue
+            action_raw = action_entry.name
+            action_dir = Path(action_entry.path)
+
+            for seg_entry in os.scandir(action_dir):
+                if not seg_entry.is_dir():
+                    continue
+                seg_raw = seg_entry.name
+                seg_dir = Path(seg_entry.path)
+
+                # Only accept suffix if allow_suffix_npy; otherwise still strip for key consistency.
+                seg_base = strip_trailing_npy_suffix(seg_raw) if allow_suffix_npy else seg_raw
+                key = build_key(person, action_raw, seg_base)
+
+                files: Dict[str, str] = {}
+                missing_hands: List[str] = []
+
+                for hand in ("left", "right"):
+                    hand_dir = seg_dir / hand
+                    if not hand_dir.exists():
+                        missing_hands.append(hand)
+                        continue
+                    npys: List[str] = []
+                    for f in os.scandir(hand_dir):
+                        if f.is_file() and f.name.lower().endswith(".npy"):
+                            npys.append(os.path.abspath(f.path))
+                    pick = pick_preferred_npy(npys)
+                    if pick is None:
+                        missing_hands.append(hand)
+                    else:
+                        files[hand] = pick
+
+                if files:
+                    index[key] = {
+                        "segment_dir": str(seg_dir.resolve()),
+                        "files": files,  # dict(left/right)
+                        "missing_hands": missing_hands,
+                    }
+
+    return index
+
+def build_index_lidar(
+    mod_root: Path,
+    persons: Tuple[str, ...],
+    allow_suffix_npy: bool = True,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Build index for lidar:
+      key -> {
+        "segment_dir": <abs segment dir>,
+        "files": <npy_path_string>
+      }
+    Expected:
+      mod_root/person/action/segment[_npy]/*.npy
+    """
+    index: Dict[str, Dict[str, Any]] = {}
+    if not mod_root.exists():
+        return index
+
+    for person in persons:
+        person_dir = mod_root / person
+        if not person_dir.exists():
+            continue
+
+        for action_entry in os.scandir(person_dir):
+            if not action_entry.is_dir():
+                continue
+            action_raw = action_entry.name
+            action_dir = Path(action_entry.path)
+
+            for seg_entry in os.scandir(action_dir):
+                if not seg_entry.is_dir():
+                    continue
+                seg_raw = seg_entry.name
+                seg_dir = Path(seg_entry.path)
+
+                seg_base = strip_trailing_npy_suffix(seg_raw) if allow_suffix_npy else seg_raw
+                key = build_key(person, action_raw, seg_base)
+
+                npys: List[str] = []
+                for f in os.scandir(seg_dir):
+                    if f.is_file() and f.name.lower().endswith(".npy"):
+                        npys.append(os.path.abspath(f.path))
+                pick = pick_preferred_npy(npys)
+                if pick is not None:
+                    index[key] = {
+                        "segment_dir": str(seg_dir.resolve()),
+                        "files": pick,  # string
+                    }
+
+    return index
+
+def build_indexes(
+    modality_parents: Dict[str, Path],
+    persons: Tuple[str, ...],
+    cam_dirs: Tuple[str, ...],
+    frame_exts: Tuple[str, ...],
+    suffix_modalities: Set[str],
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Build one index per modality.
+    Returns:
+      indexes[modality_name] = dict(key -> {"segment_dir":..., "files":...})
+    """
+    indexes: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    for mn, root in modality_parents.items():
+        root = Path(root)
+
+        if mn in ("rgb", "depth"):
+            indexes[mn] = build_index_rgb_or_depth(root, persons, cam_dirs, frame_exts)
+        elif mn == "mindrove":
+            indexes[mn] = build_index_mindrove(root, persons, allow_suffix_npy=(mn in suffix_modalities))
+        elif mn == "lidar":
+            indexes[mn] = build_index_lidar(root, persons, allow_suffix_npy=(mn in suffix_modalities))
+        else:
+            # Fallback: treat unknown modality as lidar-like npy-in-segment
+            indexes[mn] = build_index_lidar(root, persons, allow_suffix_npy=(mn in suffix_modalities))
+
+    return indexes
 
 
-# ------------------------- JSON writing -------------------------
+# ------------------------- JSON writing (O(1) lookup) -------------------------
 
-def write_split_jsons(
+def write_split_jsons_from_indexes(
     records: List[SegmentRecord],
     out_dir: Path,
     modality_parents: Dict[str, Path],
+    indexes: Dict[str, Dict[str, Dict[str, Any]]],
     suffix_modalities: Set[str],
-    frame_exts: Tuple[str, ...],
     cam_dirs: Tuple[str, ...],
+    frame_exts: Tuple[str, ...],
     require_all_modalities: bool,
 ) -> None:
+    """
+    Generate train.json / val.json / test.json using the pre-built indexes.
+    No filesystem scanning happens here.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     mod_names = sorted(modality_parents.keys())
 
@@ -685,33 +720,22 @@ def write_split_jsons(
             files_by_mod: Dict[str, Any] = {}
             segdirs_by_mod: Dict[str, str] = {}
             missing_mods: List[str] = []
-
-            # Extra detail fields
             extra: Dict[str, Any] = {}
 
             for mn in mod_names:
-                mod_root = Path(modality_parents[mn])
-                files_val, segdir, extra_info = resolve_files_for_modality(
-                    modality_name=mn,
-                    mod_root=mod_root,
-                    person=r.person,
-                    action_raw=r.action_raw,
-                    segment_base=r.segment_base,
-                    frame_exts=frame_exts,
-                    cam_dirs=cam_dirs,
-                    suffix_modalities=suffix_modalities,
-                )
+                idx = indexes.get(mn, {})
+                hit = idx.get(key)
 
-                if files_val is None or segdir is None:
+                if hit is None:
                     missing_mods.append(mn)
-                    if extra_info:
-                        extra[f"{mn}_missing_reason"] = extra_info
                     continue
 
-                files_by_mod[mn] = files_val
-                segdirs_by_mod[mn] = segdir
-                if extra_info:
-                    extra[f"{mn}_info"] = extra_info
+                files_by_mod[mn] = hit["files"]
+                segdirs_by_mod[mn] = hit["segment_dir"]
+
+                # keep extra mindrove info if present
+                if mn == "mindrove" and "missing_hands" in hit:
+                    extra["mindrove_missing_hands"] = hit["missing_hands"]
 
             if require_all_modalities and missing_mods:
                 unused.append(key)
@@ -731,7 +755,6 @@ def write_split_jsons(
                 "segment_dirs": segdirs_by_mod,
                 "missing_modalities": missing_mods,
             }
-            # attach extra info if any (e.g., mindrove missing hands)
             if extra:
                 sample_obj["extra"] = extra
 
@@ -742,15 +765,15 @@ def write_split_jsons(
                 "split": sp,
                 "modalities": mod_names,
                 "suffix_modalities": sorted(list(suffix_modalities)),
-                "frame_exts": list(frame_exts),
                 "cam_dirs": list(cam_dirs),
+                "frame_exts": list(frame_exts),
                 "require_all_modalities": require_all_modalities,
                 "unused_samples": unused,
                 "modality_parents": {k: str(Path(v).resolve()) for k, v in modality_parents.items()},
                 "note": (
-                    "rgb/depth: <segment>/<cam_xxx>/*.png (frames merged). "
-                    "mindrove: <segment>[_npy]/left|right/*.npy (returns dict). "
-                    "lidar: <segment>[_npy]/*.npy."
+                    "This JSON is generated using pre-built modality indexes (Optimization A). "
+                    "rgb/depth store per-cam frame lists. mindrove stores dict(left/right)->npy. "
+                    "lidar stores a single npy path string."
                 ),
             },
             "samples": samples,
@@ -759,7 +782,7 @@ def write_split_jsons(
         (out_dir / f"{sp}.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-# ------------------------- CSV manifests -------------------------
+# ------------------------- CSV outputs -------------------------
 
 def write_manifest_csv(out_csv: Path, records: List[SegmentRecord]) -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -826,14 +849,13 @@ def main():
     ap.add_argument("--trials", type=int, default=20000)
     ap.add_argument("--seed", type=int, default=42)
 
-    # Which modalities may use segment folder suffix "_npy"
     ap.add_argument(
         "--suffix_modalities",
         default="mindrove,lidar",
         help="Comma-separated modality names that may use segment folder suffix '_npy'. Default: mindrove,lidar",
     )
 
-    ap.add_argument("--frame_exts", default="png", help="Comma-separated frame extensions. Default: png")
+    ap.add_argument("--frame_exts", default="png", help="Comma-separated frame extensions for rgb/depth. Default: png")
 
     ap.add_argument(
         "--cam_dirs",
@@ -859,22 +881,22 @@ def main():
     cam_dirs = tuple(x.strip() for x in args.cam_dirs.split(",") if x.strip())
     suffix_modalities = {x.strip() for x in args.suffix_modalities.split(",") if x.strip()}
 
-    # 1) Canonical scan
+    # 1) Canonical records scan (directory-only scan)
     canonical_name = choose_canonical_modality(modality_parents)
     canonical_root = Path(modality_parents[canonical_name])
-    records = scan_canonical_from_modality(canonical_root, persons=persons)
+    records = scan_canonical_records(canonical_root, persons=persons)
 
     all_t1 = {r.tier1 for r in records}
     all_t2 = {r.tier2 for r in records}
     all_t3 = {r.tier3 for r in records}
 
-    # 2) Groups by run
+    # 2) Build groups by run
     groups = build_groups(records)
     ginfo = group_label_sets(records, groups)
     gsz = group_sizes(groups)
     group_ids = list(groups.keys())
 
-    # 3) Split search
+    # 3) Find best split assignment
     assignment, _cov, split_counts = search_best_split(
         group_ids=group_ids,
         group_info=ginfo,
@@ -945,6 +967,7 @@ def main():
                 f.write(" ...")
             f.write("\n")
         f.write("\n")
+
         f.write("Tier3 missing per split:\n")
         for sp in SPLITS:
             f.write(f"  {sp} missing ({len(missing_t3[sp])}): {missing_t3[sp][:80]}")
@@ -952,14 +975,24 @@ def main():
                 f.write(" ...")
             f.write("\n")
 
-    # 6) JSON outputs
-    write_split_jsons(
+    # 6) Build indexes ONCE per modality (Optimization A)
+    indexes = build_indexes(
+        modality_parents=modality_parents,
+        persons=persons,
+        cam_dirs=cam_dirs,
+        frame_exts=frame_exts,
+        suffix_modalities=suffix_modalities,
+    )
+
+    # 7) Write train/val/test JSON using indexes (fast lookup)
+    write_split_jsons_from_indexes(
         records=records,
         out_dir=out_dir,
         modality_parents=modality_parents,
+        indexes=indexes,
         suffix_modalities=suffix_modalities,
-        frame_exts=frame_exts,
         cam_dirs=cam_dirs,
+        frame_exts=frame_exts,
         require_all_modalities=args.require_all_modalities,
     )
 
