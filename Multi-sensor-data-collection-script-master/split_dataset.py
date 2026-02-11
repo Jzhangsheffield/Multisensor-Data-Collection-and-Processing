@@ -4,38 +4,55 @@
 """
 split_dataset_grouped_by_run_with_hierarchy_coverage_unified_json_v6_indexed.py
 
-✅ What this v6 does:
-  - SAME splitting logic as your previous version:
-      * records are grouped by run: group_uid = person::run_token
-      * random trials search to satisfy tier1 coverage across train/val/test (hard constraint)
-      * tier2/tier3 coverage + size balance (soft objective)
-  - NEW: Optimization A (fast):
-      * build a file index ONCE per modality (single filesystem traversal per modality)
-      * JSON generation uses O(1) dict lookup, no per-sample glob scanning
+✅ v6 + ADDITION: lighting/pos split statistics
+------------------------------------------------------------
+This version keeps your ORIGINAL splitting logic unchanged:
+  - group_uid = person::run_token
+  - random trials search to satisfy Tier1 coverage in train/val/test (hard constraint)
+  - Tier2/Tier3 coverage + size balance (soft objective)
+  - Optimization A: build file index ONCE per modality, then JSON uses O(1) lookup.
+
+🆕 What is added in THIS revision:
+  A) Split statistics for:
+     1) lighting only (normal/left/right/unknown)
+     2) armband position only (elbow/mid/unknown)
+     3) lighting × position combinations (e.g., normal_elbow, left_mid, ... + unknown combos)
+
+  B) Output CSVs:
+     - lighting_split_counts.csv
+     - pos_split_counts.csv
+     - lighting_pos_split_counts.csv
+
+Notes:
+  - These are COUNTS of segments (not groups) in each split.
+  - The splitting decision itself is NOT changed (still does NOT constrain lighting/pos).
+    This is purely for analysis / verification.
+
+Folder conventions (unchanged):
   - RGB/Depth:
       <root>/<person>/<action>/<segment>/
           cam_001431512812/*.png
           cam_001484412812/*.png
-    JSON stores per-cam lists (cam split)
 
   - MindRove:
       <root>/<person>/<action>/<segment>_npy/
           left/*.npy  (prefer clip.npy)
           right/*.npy (prefer clip.npy)
-    JSON stores dict: {"left": "...", "right": "..."} (only existing)
 
   - LiDAR:
       <root>/<person>/<action>/<segment>_npy/
           *.npy (prefer clip.npy)
-    JSON stores a single npy path (string)
 
 Key:
   key = person/action/segment_base   (segment_base strips trailing "_npy")
 
-Output:
+Outputs:
   - manifest.csv
   - run_split_map.csv
   - tier{1,2,3}_split_counts.csv
+  - lighting_split_counts.csv                🆕
+  - pos_split_counts.csv                     🆕
+  - lighting_pos_split_counts.csv            🆕
   - rare_actions_report.txt
   - train.json / val.json / test.json
 """
@@ -103,6 +120,7 @@ TIER2_ACTIONS = [
     "wrap_short_wire_with_tape",
 ]
 
+# Your known categorical values
 LIGHTS = ("normal", "right", "left")
 POSITIONS = ("elbow", "mid")
 SPLITS = ("train", "val", "test")
@@ -114,14 +132,20 @@ RUN_TOKEN_RE = re.compile(r"^run_(\d+(?:-\d+)?)", re.IGNORECASE)
 # ------------------------- Small string utils -------------------------
 
 def norm_name(s: str) -> str:
+    """Normalize string into lower snake-ish tokens."""
     s = s.strip().lower().replace(" ", "_")
     s = re.sub(r"_+", "_", s)
     return s
 
 def tokenize(name: str) -> List[str]:
+    """Tokenize name by '_' after normalization."""
     return [t for t in norm_name(name).split("_") if t]
 
 def is_subsequence(needle: List[str], hay: List[str]) -> bool:
+    """
+    Whether tokens in needle appear in hay in order (not necessarily contiguous).
+    Used for matching tier2 phrases inside tier3 action tokens.
+    """
     if not needle:
         return True
     j = 0
@@ -140,18 +164,26 @@ def strip_trailing_npy_suffix(seg_dirname: str) -> str:
     return s
 
 def build_key(person: str, action_raw: str, segment_base: str) -> str:
+    """Unified sample key used across modalities."""
     return f"{person}/{action_raw}/{segment_base}"
 
 
 # ------------------------- Tier mapping -------------------------
 
 def get_tier1_verb(tier3_action: str) -> str:
+    """
+    Tier1 is the main verb token (special-case 'pull_out').
+    """
     t3 = tokenize(tier3_action)
     if len(t3) >= 2 and f"{t3[0]}_{t3[1]}" == "pull_out":
         return "pull_out"
     return t3[0] if t3 else "UNKNOWN"
 
 def best_tier2_match(tier3_action: str, tier2_list: List[str]) -> Optional[str]:
+    """
+    Find best tier2 phrase that is a subsequence of tier3 tokens, while enforcing verb match.
+    Longer matches win.
+    """
     t3 = tokenize(tier3_action)
     verb = "pull_out" if (len(t3) >= 2 and f"{t3[0]}_{t3[1]}" == "pull_out") else (t3[0] if t3 else None)
 
@@ -175,6 +207,12 @@ def best_tier2_match(tier3_action: str, tier2_list: List[str]) -> Optional[str]:
 # ------------------------- Segment meta parsing -------------------------
 
 def parse_segment_meta_last2(seg_base: str) -> Tuple[str, str]:
+    """
+    Your segment naming convention:
+      ..._<lighting>_<pos>
+    E.g., run_3_clip_000031_normal_elbow
+    We take the last 2 tokens and validate them.
+    """
     toks = tokenize(seg_base)
     if len(toks) < 2:
         return "unknown", "unknown"
@@ -187,6 +225,7 @@ def parse_segment_meta_last2(seg_base: str) -> Tuple[str, str]:
     return lighting, pos
 
 def extract_run_token(seg_base: str) -> Optional[str]:
+    """Extract run token like run_3 or run_24-37 from segment base."""
     m = RUN_TOKEN_RE.match(seg_base.strip())
     if not m:
         m = RUN_TOKEN_RE.match(norm_name(seg_base))
@@ -220,6 +259,10 @@ class SegmentRecord:
 # ------------------------- Arg helpers -------------------------
 
 def parse_modality_args(modality_args: List[str]) -> Dict[str, Path]:
+    """
+    Parse repeatable args like:
+      --modality rgb=PATH --modality lidar=PATH
+    """
     out: Dict[str, Path] = {}
     for item in modality_args:
         if "=" not in item:
@@ -233,7 +276,7 @@ def parse_modality_args(modality_args: List[str]) -> Dict[str, Path]:
     return out
 
 def choose_canonical_modality(modality_parents: Dict[str, Path]) -> str:
-    """Prefer rgb, else choose first alphabetically."""
+    """Prefer rgb as canonical; else choose first alphabetically."""
     if "rgb" in modality_parents:
         return "rgb"
     return sorted(modality_parents.keys())[0]
@@ -292,7 +335,7 @@ def scan_canonical_records(
                         tier2=tier2,
                         tier1=tier1,
                         run_token=run_token,
-                        group_uid=f"{person}::{run_token}",
+                        group_uid=f"{person}::{run_token}",  # ✅ grouping by run
                         lighting=lighting,
                         pos=pos,
                     )
@@ -304,12 +347,17 @@ def scan_canonical_records(
 # ------------------------- Group helpers -------------------------
 
 def build_groups(records: List[SegmentRecord]) -> Dict[str, List[int]]:
+    """group_uid -> list of record indices."""
     groups: Dict[str, List[int]] = defaultdict(list)
     for i, r in enumerate(records):
         groups[r.group_uid].append(i)
     return groups
 
 def group_label_sets(records: List[SegmentRecord], groups: Dict[str, List[int]]) -> Dict[str, Dict[str, Set[str]]]:
+    """
+    For each group, precompute which tier labels appear in that group.
+    This makes evaluation fast.
+    """
     info: Dict[str, Dict[str, Set[str]]] = {}
     for gid, idxs in groups.items():
         t1, t2, t3 = set(), set(), set()
@@ -321,6 +369,7 @@ def group_label_sets(records: List[SegmentRecord], groups: Dict[str, List[int]])
     return info
 
 def group_sizes(groups: Dict[str, List[int]]) -> Dict[str, int]:
+    """Group size is number of segments in that run-group."""
     return {gid: len(idxs) for gid, idxs in groups.items()}
 
 
@@ -333,6 +382,17 @@ def evaluate_assignment(
     all_t1: Set[str],
     target_counts: Dict[str, float],
 ) -> Tuple[float, Dict[str, Dict[str, Set[str]]], Dict[str, int]]:
+    """
+    Score an assignment of groups->split.
+
+    Hard constraint:
+      - every tier1 label must appear in EACH split.
+
+    Soft objective:
+      - maximize (sum of tier2 coverages across splits)
+      - maximize (sum of tier3 coverages across splits)
+      - penalize deviation from target split sizes
+    """
     cov = {sp: {"tier1": set(), "tier2": set(), "tier3": set()} for sp in SPLITS}
     split_counts = {sp: 0 for sp in SPLITS}
 
@@ -348,7 +408,7 @@ def evaluate_assignment(
         score = -1e12 - 1e9 * missing_t1_total
         return score, cov, split_counts
 
-    # Soft objective: maximize tier2 and tier3 coverage, penalize size deviation
+    # Soft objective
     t2_score = sum(len(cov[sp]["tier2"]) for sp in SPLITS)
     t3_score = sum(len(cov[sp]["tier3"]) for sp in SPLITS)
     dev_pen = sum(abs(split_counts[sp] - target_counts[sp]) for sp in SPLITS)
@@ -356,7 +416,17 @@ def evaluate_assignment(
     score = 1000.0 * t2_score + 100.0 * t3_score - 1.0 * dev_pen
     return score, cov, split_counts
 
-def random_initial_assignment(group_ids: List[str], group_sz: Dict[str, int], target_counts: Dict[str, float], rng) -> Dict[str, str]:
+def random_initial_assignment(
+    group_ids: List[str],
+    group_sz: Dict[str, int],
+    target_counts: Dict[str, float],
+    rng
+) -> Dict[str, str]:
+    """
+    Greedy randomized packing:
+      - shuffle groups
+      - assign each group to split with currently largest remaining target budget
+    """
     remaining = dict(target_counts)
     gids = group_ids[:]
     rng.shuffle(gids)
@@ -385,6 +455,10 @@ def search_best_split(
     trials: int,
     seed: int,
 ) -> Tuple[Dict[str, str], Dict[str, Dict[str, Set[str]]], Dict[str, int]]:
+    """
+    Random search over assignments.
+    Keeps the best scoring one.
+    """
     import random
     rng = random.Random(seed)
 
@@ -417,6 +491,9 @@ def search_best_split(
 # ------------------------- Reports / counts -------------------------
 
 def per_tier_split_counts(records: List[SegmentRecord]) -> Dict[str, Dict[str, Counter]]:
+    """
+    Count segments per tier label per split.
+    """
     out = {
         "tier1": {sp: Counter() for sp in SPLITS},
         "tier2": {sp: Counter() for sp in SPLITS},
@@ -429,6 +506,10 @@ def per_tier_split_counts(records: List[SegmentRecord]) -> Dict[str, Dict[str, C
     return out
 
 def write_tier_split_counts_csv(path: Path, tier_name: str, split_counters: Dict[str, Counter]) -> None:
+    """
+    Write a tier split count table:
+      label, train, val, test, total
+    """
     labels = set()
     for sp in SPLITS:
         labels.update(split_counters[sp].keys())
@@ -449,6 +530,10 @@ def write_tier_split_counts_csv(path: Path, tier_name: str, split_counters: Dict
             w.writerow(list(r))
 
 def count_groups_per_label(records: List[SegmentRecord], groups: Dict[str, List[int]], tier_attr: str) -> Dict[str, int]:
+    """
+    For each label, count how many distinct run-groups contain that label.
+    Used to detect labels that cannot appear in all 3 splits (need >=3 groups).
+    """
     label_to_groups: Dict[str, Set[str]] = defaultdict(set)
     for gid, idxs in groups.items():
         labels = {getattr(records[i], tier_attr) for i in idxs}
@@ -457,7 +542,70 @@ def count_groups_per_label(records: List[SegmentRecord], groups: Dict[str, List[
     return {lab: len(gset) for lab, gset in label_to_groups.items()}
 
 def missing_labels_in_split(split_counter: Counter, all_labels: Set[str]) -> List[str]:
+    """Which labels have zero count in a split."""
     return sorted([lab for lab in all_labels if split_counter.get(lab, 0) == 0])
+
+# ------------------------- NEW: Lighting / Position split counts -------------------------
+
+def per_attr_split_counts(records: List[SegmentRecord], attr: str) -> Dict[str, Counter]:
+    """
+    Generic counter: count records by an attribute (e.g., 'lighting' or 'pos') per split.
+
+    Returns:
+      { split: Counter({attr_value: count, ...}), ... }
+    """
+    out = {sp: Counter() for sp in SPLITS}
+    for r in records:
+        if r.split not in SPLITS:
+            continue
+        val = getattr(r, attr, "unknown")
+        if not val:
+            val = "unknown"
+        out[r.split][val] += 1
+    return out
+
+def per_combo_split_counts(records: List[SegmentRecord], attr1: str, attr2: str, sep: str = "_") -> Dict[str, Counter]:
+    """
+    Combo counter: count records by attr1+sep+attr2 per split.
+    Example: lighting_pos => normal_elbow, left_mid, ...
+
+    Returns:
+      { split: Counter({combo: count, ...}), ... }
+    """
+    out = {sp: Counter() for sp in SPLITS}
+    for r in records:
+        if r.split not in SPLITS:
+            continue
+        v1 = getattr(r, attr1, "unknown") or "unknown"
+        v2 = getattr(r, attr2, "unknown") or "unknown"
+        combo = f"{v1}{sep}{v2}"
+        out[r.split][combo] += 1
+    return out
+
+def write_attr_split_counts_csv(path: Path, header_name: str, split_counters: Dict[str, Counter]) -> None:
+    """
+    Write attribute split count table:
+      value, train, val, test, total
+    """
+    labels = set()
+    for sp in SPLITS:
+        labels.update(split_counters[sp].keys())
+
+    rows = []
+    for lab in labels:
+        tr = split_counters["train"].get(lab, 0)
+        va = split_counters["val"].get(lab, 0)
+        te = split_counters["test"].get(lab, 0)
+        tot = tr + va + te
+        rows.append((lab, tr, va, te, tot))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([header_name, "train", "val", "test", "total"])
+        # sort by total desc then label
+        for r in sorted(rows, key=lambda x: (-x[4], x[0])):
+            w.writerow(list(r))
 
 
 # ------------------------- Index building (Optimization A) -------------------------
@@ -486,6 +634,7 @@ def build_index_rgb_or_depth(
         "segment_dir": <abs segment dir>,
         "files": {cam_dir: [abs_frame_paths...] }   (only cams with frames)
       }
+
     Only traverses expected depth:
       mod_root/person/action/segment/cam/*.ext
     """
@@ -513,7 +662,7 @@ def build_index_rgb_or_depth(
                 seg_raw = seg_entry.name
                 seg_dir = Path(seg_entry.path)
 
-                seg_base = strip_trailing_npy_suffix(seg_raw)  # normally no _npy for rgb/depth, but safe
+                seg_base = strip_trailing_npy_suffix(seg_raw)  # safe
                 key = build_key(person, action_raw, seg_base)
 
                 files_by_cam: Dict[str, List[str]] = {}
@@ -522,11 +671,9 @@ def build_index_rgb_or_depth(
                     if not cam_path.exists():
                         continue
                     frames: List[str] = []
-                    # scan files in cam folder
                     for f in os.scandir(cam_path):
                         if not f.is_file():
                             continue
-                        # extension filter
                         ext = os.path.splitext(f.name)[1].lstrip(".").lower()
                         if ext in frame_exts_lc:
                             frames.append(os.path.abspath(f.path))
@@ -554,6 +701,7 @@ def build_index_mindrove(
         "files": {"left": <npy>, "right": <npy>}  (only hands that exist)
         "missing_hands": [...]
       }
+
     Expected:
       mod_root/person/action/segment[_npy]/left|right/*.npy
     """
@@ -578,7 +726,6 @@ def build_index_mindrove(
                 seg_raw = seg_entry.name
                 seg_dir = Path(seg_entry.path)
 
-                # Only accept suffix if allow_suffix_npy; otherwise still strip for key consistency.
                 seg_base = strip_trailing_npy_suffix(seg_raw) if allow_suffix_npy else seg_raw
                 key = build_key(person, action_raw, seg_base)
 
@@ -603,7 +750,7 @@ def build_index_mindrove(
                 if files:
                     index[key] = {
                         "segment_dir": str(seg_dir.resolve()),
-                        "files": files,  # dict(left/right)
+                        "files": files,
                         "missing_hands": missing_hands,
                     }
 
@@ -615,11 +762,12 @@ def build_index_lidar(
     allow_suffix_npy: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Build index for lidar:
+    Build index for lidar (and also fallback for other npy-like modalities):
       key -> {
         "segment_dir": <abs segment dir>,
         "files": <npy_path_string>
       }
+
     Expected:
       mod_root/person/action/segment[_npy]/*.npy
     """
@@ -655,7 +803,7 @@ def build_index_lidar(
                 if pick is not None:
                     index[key] = {
                         "segment_dir": str(seg_dir.resolve()),
-                        "files": pick,  # string
+                        "files": pick,
                     }
 
     return index
@@ -670,7 +818,7 @@ def build_indexes(
     """
     Build one index per modality.
     Returns:
-      indexes[modality_name] = dict(key -> {"segment_dir":..., "files":...})
+      indexes[modality_name] = dict(key -> {"segment_dir":..., "files":...}
     """
     indexes: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
@@ -733,7 +881,6 @@ def write_split_jsons_from_indexes(
                 files_by_mod[mn] = hit["files"]
                 segdirs_by_mod[mn] = hit["segment_dir"]
 
-                # keep extra mindrove info if present
                 if mn == "mindrove" and "missing_hands" in hit:
                     extra["mindrove_missing_hands"] = hit["missing_hands"]
 
@@ -785,6 +932,7 @@ def write_split_jsons_from_indexes(
 # ------------------------- CSV outputs -------------------------
 
 def write_manifest_csv(out_csv: Path, records: List[SegmentRecord]) -> None:
+    """Write full manifest of all segments."""
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with out_csv.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -805,6 +953,7 @@ def write_manifest_csv(out_csv: Path, records: List[SegmentRecord]) -> None:
             ])
 
 def write_run_split_map_csv(out_csv: Path, groups: Dict[str, List[int]], records: List[SegmentRecord], assignment: Dict[str, str]) -> None:
+    """Write which run-group goes to which split."""
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     rows = []
     for gid, idxs in groups.items():
@@ -847,7 +996,7 @@ def main():
     ap.add_argument("--test_ratio", type=float, default=0.1)
 
     ap.add_argument("--trials", type=int, default=20000)
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seed", type=int, default=100)
 
     ap.add_argument(
         "--suffix_modalities",
@@ -918,7 +1067,7 @@ def main():
     write_manifest_csv(manifest_path, records)
     write_run_split_map_csv(run_map_path, groups, records, assignment)
 
-    # 5) Count tables + rare report
+    # 5) Tier count tables + rare report (unchanged)
     counts = per_tier_split_counts(records)
     write_tier_split_counts_csv(out_dir / "tier1_split_counts.csv", "tier1", counts["tier1"])
     write_tier_split_counts_csv(out_dir / "tier2_split_counts.csv", "tier2", counts["tier2"])
@@ -975,6 +1124,20 @@ def main():
                 f.write(" ...")
             f.write("\n")
 
+    # ------------------------- NEW: write lighting/pos stats -------------------------
+    # 5.1 lighting only
+    lighting_counts = per_attr_split_counts(records, attr="lighting")
+    write_attr_split_counts_csv(out_dir / "lighting_split_counts.csv", "lighting", lighting_counts)
+
+    # 5.2 position only
+    pos_counts = per_attr_split_counts(records, attr="pos")
+    write_attr_split_counts_csv(out_dir / "pos_split_counts.csv", "pos", pos_counts)
+
+    # 5.3 lighting x position combos
+    combo_counts = per_combo_split_counts(records, attr1="lighting", attr2="pos", sep="_")
+    write_attr_split_counts_csv(out_dir / "lighting_pos_split_counts.csv", "lighting_pos", combo_counts)
+    # -------------------------------------------------------------------------------
+
     # 6) Build indexes ONCE per modality (Optimization A)
     indexes = build_indexes(
         modality_parents=modality_parents,
@@ -1000,6 +1163,8 @@ def main():
     print(f"- manifest: {manifest_path}")
     print(f"- run map : {run_map_path}")
     print(f"- report  : {report_path}")
+    print(f"- tier cnt: {out_dir}/tier1_split_counts.csv , tier2_split_counts.csv , tier3_split_counts.csv")
+    print(f"- light/pos stats: {out_dir}/lighting_split_counts.csv , pos_split_counts.csv , lighting_pos_split_counts.csv")
     print(f"- json    : {out_dir}/train.json , val.json , test.json")
     print(f"  canonical_modality = {canonical_name}")
     print(f"  suffix_modalities  = {sorted(list(suffix_modalities))}")
