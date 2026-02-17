@@ -15,6 +15,17 @@ using motion-energy signals derived from:
      - Default is "naive" behavior (keeps your old result)
      - If you need DST-safe behavior, set: --ts_tz Europe/London or --ts_tz UTC
 
+✅ NEW FEATURE (manual visual alignment mode):
+  4) Manual shift plotting mode (--manual_shift_s)
+     - If provided, NO cross-correlation scan will be performed.
+     - The script will plot:
+         a) RGB motion energy (grid)
+         b) original LiDAR motion energy (grid)
+         c) shifted LiDAR motion energy (grid + manual Δt)
+     - This lets you visually inspect alignment and decide the shift by hand.
+     - When manual mode is enabled, drift estimation is automatically disabled
+       to respect "no correlation/scan" requirement.
+
 Output per subject:
 - <out_dir>/plots/<run_name>__<lidar_session>__<lidar_feature>.png
 - <out_dir>/run_offsets.json      : summary list (written at end)
@@ -403,6 +414,9 @@ def estimate_drift_piecewise(
     """
     Estimate drift by splitting timeline into windows and estimating offset per window,
     then fitting offset(T) = p*T + q.
+
+    NOTE: This routine relies on estimate_offset_by_scan(), so it is DISABLED when
+    manual shift mode is enabled (--manual_shift_s), to satisfy "no correlation scan".
     """
     t0, t1 = float(tg[0]), float(tg[-1])
     centers, offsets, corrs = [], [], []
@@ -447,7 +461,14 @@ def plot_alignment(
     best_delta: float,
     title: str,
 ):
-    """Plot z-scored RGB and LiDAR motion signals on the unified grid, plus shifted LiDAR."""
+    """
+    Plot z-scored RGB and LiDAR motion signals on the unified grid, plus shifted LiDAR.
+
+    - Always plots:
+        1) RGB motion (grid)
+        2) LiDAR motion (grid, original)
+        3) LiDAR motion shifted by Δt (either auto-estimated or manual)
+    """
     out_png.parent.mkdir(parents=True, exist_ok=True)
 
     plt.figure(figsize=(12, 6))
@@ -490,6 +511,7 @@ def process_one_run(
     warmup_s: float,
     tail_trim_s: float,
     ts_tz: Optional[str],
+    manual_shift_s: Optional[float],  # ✅ NEW
 ) -> Dict:
     """
     Process one run:
@@ -498,8 +520,10 @@ def process_one_run(
       3) compute intersection time range
       4) drop warm-up seconds AFTER intersection start + trim tail seconds
       5) interpolate both signals to unified time grid
-      6) scan offset that maximizes correlation
-      7) optional drift estimation
+      6) offset:
+          - auto mode: scan offset that maximizes correlation
+          - manual mode (--manual_shift_s): use given Δt, NO scanning
+      7) optional drift estimation (auto mode only)
       8) save plot
       9) return a dict with results and metadata
     """
@@ -556,10 +580,20 @@ def process_one_run(
     rgb_g = interp_to_grid(t_rgb, zscore(m_rgb), t_grid)
     lidar_g = interp_to_grid(t_lidar, zscore(m_lidar), t_grid)
 
-    # 6) estimate offset
-    best_delta, best_corr = estimate_offset_by_scan(
-        t_grid, rgb_g, lidar_g, search_s=float(search_s), step_s=float(step_s)
-    )
+    # 6) estimate offset OR use manual shift
+    manual_mode = (manual_shift_s is not None)
+    if manual_mode:
+        best_delta = float(manual_shift_s)
+        best_corr = None  # explicitly indicate "not computed"
+        # Respect "no cross-correlation scan" requirement:
+        do_drift_effective = False
+        drift = None
+    else:
+        best_delta, best_corr = estimate_offset_by_scan(
+            t_grid, rgb_g, lidar_g, search_s=float(search_s), step_s=float(step_s)
+        )
+        do_drift_effective = bool(do_drift)
+        drift = None
 
     run_name = rgb_dir.parents[1].name      # .../kinect/run_x/<cam>/frames_rgb_blured
     lidar_session = lidar_dir.name          # .../vlp16/run_x/<session>
@@ -598,13 +632,18 @@ def process_one_run(
         "overlap_raw_s": float(t_end0 - t_start0),
         "overlap_used_s": float(t_end - t_start),
 
+        # ✅ NEW: record mode
+        "mode": "manual" if manual_mode else "auto",
+        "manual_shift_s": float(best_delta) if manual_mode else None,
+
         "best_delta_s": float(best_delta),
-        "best_corr": float(best_corr),
+        "best_corr": None if best_corr is None else float(best_corr),
 
         "drift": None,
     }
 
-    if do_drift:
+    # 7) optional drift estimation (auto mode only)
+    if do_drift_effective:
         drift = estimate_drift_piecewise(
             t_grid, rgb_g, lidar_g,
             search_s=float(search_s), step_s=float(step_s),
@@ -612,13 +651,25 @@ def process_one_run(
         )
         result["drift"] = drift
 
+    # 8) plot
+    if manual_mode:
+        title = (
+            f"{run_name} | session={lidar_session} | feature={lidar_feature} | "
+            f"MANUAL Δt={best_delta:+.3f}s"
+        )
+    else:
+        title = (
+            f"{run_name} | session={lidar_session} | feature={lidar_feature} | "
+            f"corr={float(best_corr):.3f}"
+        )
+
     plot_alignment(
         out_png=out_png,
         t_grid=t_grid,
         rgb_g=rgb_g,
         lidar_g=lidar_g,
         best_delta=best_delta,
-        title=f"{run_name} | session={lidar_session} | feature={lidar_feature} | corr={best_corr:.3f}",
+        title=title,
     )
 
     return result
@@ -683,6 +734,7 @@ def worker_process_one_run(job: Dict) -> Dict:
             warmup_s=float(job["warmup_s"]),
             tail_trim_s=float(job["tail_trim_s"]),
             ts_tz=job.get("ts_tz", None),
+            manual_shift_s=job.get("manual_shift_s", None),  # ✅ NEW
         )
         res["subject_root"] = str(job["subject_root"])
         return res
@@ -735,6 +787,7 @@ def process_one_subject(subject_root: Path, args) -> None:
 
     # Optional run filter
     only_run_set = set(args.only_run) if args.only_run else None
+
     def should_run(run_name: str) -> bool:
         return True if only_run_set is None else (run_name in only_run_set)
 
@@ -745,6 +798,10 @@ def process_one_subject(subject_root: Path, args) -> None:
 
     print(f"\n========== SUBJECT: {subject_root} ==========")
     print(f"Output -> {out_dir}")
+
+    # If manual mode: remind user drift will be disabled.
+    if args.manual_shift_s is not None and args.do_drift:
+        print("[NOTE] --manual_shift_s is set, so drift estimation will be disabled (no correlation scans).")
 
     # ----------------------------------------------------------
     # Build job list
@@ -786,6 +843,7 @@ def process_one_subject(subject_root: Path, args) -> None:
             "step_s": args.step_s,
             "grid_dt": args.grid_dt,
 
+            # drift is allowed only in auto-mode; in manual-mode we will disable inside process_one_run
             "do_drift": args.do_drift,
             "drift_win_s": args.drift_win_s,
             "drift_hop_s": args.drift_hop_s,
@@ -797,6 +855,9 @@ def process_one_subject(subject_root: Path, args) -> None:
             "tail_trim_s": args.tail_trim_s,
 
             "ts_tz": args.ts_tz if args.ts_tz else None,
+
+            # ✅ NEW: manual shift per run (same value for all runs; you can extend later if needed)
+            "manual_shift_s": args.manual_shift_s if args.manual_shift_s is not None else None,
         })
 
     if not jobs:
@@ -822,7 +883,10 @@ def process_one_subject(subject_root: Path, args) -> None:
             if "error" in res:
                 print(f"  !! FAILED: {job['run_name']}: {res['error']}")
             else:
-                print(f"  -> best_delta_s={res['best_delta_s']:+.3f}, corr={res['best_corr']:.3f}")
+                if res.get("mode") == "manual":
+                    print(f"  -> MANUAL shift Δt={res['best_delta_s']:+.3f}s")
+                else:
+                    print(f"  -> best_delta_s={res['best_delta_s']:+.3f}, corr={res['best_corr']:.3f}")
                 print(f"  -> plot: {res['plot_path']}")
 
     else:
@@ -844,7 +908,10 @@ def process_one_subject(subject_root: Path, args) -> None:
                 if "error" in res:
                     print(f"  !! FAILED: {job['run_name']}: {res['error']}")
                 else:
-                    print(f"  -> DONE {job['run_name']}: best_delta_s={res['best_delta_s']:+.3f}, corr={res['best_corr']:.3f}")
+                    if res.get("mode") == "manual":
+                        print(f"  -> DONE {job['run_name']}: MANUAL shift Δt={res['best_delta_s']:+.3f}s")
+                    else:
+                        print(f"  -> DONE {job['run_name']}: best_delta_s={res['best_delta_s']:+.3f}, corr={res['best_corr']:.3f}")
 
     # ----------------------------------------------------------
     # Write final summary JSON (list of results)
@@ -908,7 +975,7 @@ def main():
     ap.add_argument("--lidar_hist_bins", type=int, default=40)
 
     ap.add_argument(
-        "--warmup_s", type=float, default=8.0,
+        "--warmup_s", type=float, default=6.0,
         help="Drop warm-up seconds AFTER intersection start"
     )
 
@@ -922,18 +989,27 @@ def main():
         help="Only process specified run(s), e.g. --only_run run_10 run_1 run_8-37"
     )
 
-    # ✅ NEW: per-run parallelism
+    # ✅ per-run parallelism
     ap.add_argument(
         "--jobs", type=int, default=3,
         help="Number of parallel processes PER SUBJECT. 1 = no parallel. "
              "If data is on HDD, try small values (2~4). If on SSD/NVMe, higher can help."
     )
 
-    # ✅ NEW: timezone-aware parsing option
+    # ✅ timezone-aware parsing option
     ap.add_argument(
         "--ts_tz", type=str, default=None,
         help="Timezone used to interpret filename timestamps (YYYYMMDD_HHMMSS_micro). "
              "Default None keeps old naive behavior. Examples: Europe/London, UTC"
+    )
+
+    # ✅ NEW: manual shift mode (no correlation scan)
+    ap.add_argument(
+        "--manual_shift_s", type=float, default=None,
+        help="Manual time shift Δt in seconds. If set, the script will NOT perform "
+             "cross-correlation scan. It will directly plot RGB, original LiDAR, and "
+             "LiDAR shifted by this Δt for visual inspection. "
+             "Convention is the same as auto mode: delta > 0 means compare rgb(t) with lidar(t + delta)."
     )
 
     args = ap.parse_args()
