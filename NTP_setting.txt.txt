@@ -1,0 +1,81 @@
+###-------------------------------该文档讲述了如何在Ubuntu和Windows上设置NTP同步------------------------------------------------------------
+### 每次开机后，先重启server的ntp服务，等待server的ntp服务收敛，然后启动client的ntp服务，等待client的ntp收敛后，才能进行采集。
+### 收敛所用时间可在15-30min
+##----------------------将Windows作为服务器需要的设置(弃用)-------------------------------
+
+1. 首先设置Windows的上位服务器，Windows将从上位服务器中获取时间，并供后续的Ubuntu系统同步使用
+regedit 打开注册表设置以下参数
+\HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\W32Time\Config
+--AnnounceFlags 设置为5，表示该机器提供的时间源可靠
+\HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpServer
+--Enable 设置为1， 表示开启将该windows作为NTPserver.
+
+2.  使用以下命令设置windows的上位服务器
+w32tm /config /manualpeerlist:"time.windows.com" /syncfromflags:manual /reliable:YES /update
+修改time.windows.com为不同的地址/ip，可以设置不同的上位服务器。
+
+3. 开放防火墙的123的UDP端口供NTP使用
+netsh advfirewall firewall add rule name="NTP Server" dir=in action=allow protocol=udp localport=123
+同时还应修改防火墙的公共配置文件 （Windows Defender 防火墙属性)，取消对连接端口的保护
+
+4. 以下命令用于查看w32tm的设置
+--w32tm /query /configuration
+--w32tm /query /status
+--w32tm /query /peers
+
+
+##----------------------将Windows作为服务器需要的设置(最新)-------------------------------
+1. 开放防火墙的123的UDP端口供NTP使用
+netsh advfirewall firewall add rule name="NTP Server" dir=in action=allow protocol=udp localport=123
+同时还应修改防火墙的公共配置文件 （Windows Defender 防火墙属性)，取消对连接端口的保护
+
+2. 下载并安装meinberg ntp for windows. https://www.meinbergglobal.com/english/sw/ntp.htm
+
+3. 配置C:\Program Files (x86)\NTP\etc\ntp.conf 配置文件
+--restrict 192.168.0.0 mask 255.255.255.0 nomodify notrap 主机添加行
+--server 192.168.100.2 iburst minpoll 6 maxpoll 7 prefer 客户端添加这一行，prefer表示优先使用. 
+--(server windows.time.com iburst minpoll 6 maxpoll 7) 也可添加这一行，在没有prefer服务器时使用.
+--取消server 127.127.1.0 和 fudge 127.127.1.0 stratum 10 行注释，在没有其他服务器可用时使用电脑的硬件时间。(stratum表示第几个分级的服务器，级数越大，越不可靠)
+
+4. 以下命令用于查看ntp的配值
+net start ntp / net stop ntp
+ntpq -p
+ntpstatus
+
+
+##----------------------将Ubuntu作为客户端的设置-------------------------------
+
+1. 安装chrony
+sudo apt install chrony
+
+2. 配置chrony 配置文件
+sudo gedit /etc/chrony/chrony.conf
+--注释掉以pool开头的行, 
+--增加以下行
+  --server 192.168.100.2 iburst minpoll 9 maxpoll 9 prefer
+  --maxdistance 16.0 (这里数值设置要大于sudo chronyc ntpdata 输出的Root dispersion值)
+--修改以下行
+  --makestep 0.03 -1 与服务器误差大于30ms就同步
+
+3. 重启chrony服务
+sudo systemctl restart chrony
+
+4. 以下命令可以查看chrony的设置
+sudo chronyc sources -v
+sudo chronyc tracking
+watch -n 10 -d chronyc tracking #每10秒刷新显示一次同步状态
+sudo systemctl status chrony.service
+
+
+##------------------------以下命令用于控制ubuntu的ntp服务----------------------------
+sudo systemctl stop (systemd-timesyncd/chrony) ~ sudo systemctl start (systemd-timesyncd/chrony) 
+sudo systemctl disable (systemd-timesyncd/chrony)  ~ sudo systemctl enable (systemd-timesyncd/chrony) 
+
+systemd-timesyncd是ubuntu系统自带的时间同步包，在数据采集结束后可以再使用这个。
+timedatectl status
+
+systemd-timesyncd和chrony不能共存，安装一个会自动卸载另一个。要重启另一个，需要重装。不使用purge卸载，保存配置文件。
+
+
+
+

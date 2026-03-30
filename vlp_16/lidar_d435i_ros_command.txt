@@ -1,0 +1,47 @@
+----------------用于启动vlp-16 lidar的command-----------------
+#先使用该命令启动lidar，发送raw data
+ros2 run velodyne_driver velodyne_driver_node --ros-args -p model:=VLP16
+
+#再使用该命令，将raw data转换为点状云。 可以指定的参数如下:
+ros2 run velodyne_pointcloud velodyne_transform_node --ros-args -p calibration:="/home/uos/sensor_sync/src/velodyne/velodyne_pointcloud/params/VLP16db.yaml" -p model:=VLP16
+----calibration (string) - The path to the calibration file for the particular device. There are a set of default calibration files to start with in the “params” subdirectory in this package. Defaults to the empty string.
+----min_range (double) - The minimum range in meters that a point must be to be added to the resulting point cloud. Points closer than this are discarded. Must be between 0.1 and 10.0. Defaults to 0.9.
+----max_range (double) - The maximum range in meters that a point must be to be added to the resulting point cloud. Points further away than this are discarded. Must be between 0.1 and 200.0. Defaults to 130.0.
+----view_direction (double) - The point around the circumference of the device, in radians, to “center” the view. Combined with view_width, this allows the node to generate a pointcloud only for the given width, centered at this point. This can vastly reduce the CPU requirements of the node. Must be between -Pi and Pi, where 0 is straight ahead from the device. Defaults to 0.0.
+----view_width (double) - The width, in radians, of the view to generate for the resulting pointcloud. Combined with view_direction, this allows the node to generate a pointcloud only for the given width, centered at the view_direction point. This can vastly reduce the CPU requirements of the node. Must be between 0 and 2Pi. Defaults to 2Pi.
+----organize_cloud (bool) - Whether to organize the cloud by ring (True), or to use the order as it comes directly from the driver (False). Defaults to True.
+----target_frame (string) - The coordinate frame to apply to the generated point cloud header before publishing. If the empty string (the default), the frame is passed along from the driver packet. If this frame is different than the fixed_frame, a transformation to this coordinate frame is performed while creating the pointcloud.
+----fixed_frame (string) - The fixed coordinate frame to transform the data from.
+
+#也可以使用launch文件启动，需要修改参数的话, 则对/home/uos/sensor_sync/src/velodyne/velodyne_pointcloud/config/VLP16-velodyne_transform_node-params.yaml文件进行修改即可
+# 修改后请重新编译
+ros2 launch velodyne_pointcloud velodyne_transform_node-VLP16-composed-launch.py
+
+
+
+------------------用于启动D435i的command------------------------
+#启动相机的命令， 可设置的参数可以见: /home/uos/sensor_sync/src/realsense-ros/realsense2_camera/launch/rs_launch.py
+ros2 launch realsense2_camera rs_launch.py
+
+#
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-------------------rviz2的用法--------------------------------
+#想要查看正确的topic的输出，要更改fixed frame. 这一项可以通过以下命令得到：
+ros2 topic echo /topic | grep frame_id
